@@ -1,3 +1,7 @@
 .zig-cache/
 zig-out/
 *.o
+
+# misc
+mqtt/mosquitto/data
+mqtt/mosquitto/log
