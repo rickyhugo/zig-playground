@@ -2,6 +2,6 @@
 zig-out/
 *.o
 
-# misc
+# mosquitto
 mqtt/mosquitto/data
 mqtt/mosquitto/log
