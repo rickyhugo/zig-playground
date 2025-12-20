@@ -1,30 +1,44 @@
 const std = @import("std");
 const net = std.net;
 
+const codec = @import("codec.zig");
+const mqtt = @import("mqtt.zig");
+
 pub fn main() !void {
     // 1. TCP connect to localhost:1883
+
     const stream = try net.tcpConnectToHost(std.heap.page_allocator, "localhost", 1883);
     defer stream.close();
 
     std.debug.print("Connected to broker\n", .{});
 
-    // 2. Send CONNECT packet
-    // Fixed header:     10 10 (CONNECT, remaining length 16)
-    // Protocol name:    00 04 "MQTT"
-    // Protocol level:   04 (3.1.1)
-    // Connect flags:    02 (clean session)
-    // Keep alive:       00 3C (60 seconds)
-    // Client ID:        00 04 "zig!"
-    const connect_packet = [_]u8{
-        0x10, 0x10, // Fixed header (remaining length = 16)
-        0x00, 0x04, 'M', 'Q', 'T', 'T', // Protocol name (6 bytes)
-        0x04, // Protocol level (3.1.1) (1 byte)
-        0x02, // Connect flags (clean session) (1 byte)
-        0x00, 0x3C, // Keep alive (60 seconds) (2 bytes)
-        0x00, 0x04, 'z', 'i', 'g', '!', // Client ID (6 bytes)
-    }; // Total after fixed header: 6+1+1+2+6 = 16
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-    try stream.writeAll(&connect_packet);
+    const write_buf_size: u16 = 8192;
+    const write_buf = try allocator.alloc(u8, write_buf_size);
+    defer allocator.free(write_buf);
+
+    // const connect_packet = try codec.encodeConnect(
+    //     .mqtt_3_1_1,
+    //     write_buf,
+    //     .{ .client_id = "hugoplanet" },
+    // );
+    //
+    // try stream.writeAll(connect_packet);
+
+    var client = try mqtt.Client311.init(.{
+        .port = 1883,
+        .host = "localhost",
+        // It IS possible to use the posix client without an allocator, see readme
+        .allocator = allocator,
+    });
+
+    _ = try client.connect(
+        .{ .timeout = 2000 },
+        .{ .client_id = "my client" },
+    );
 
     // 3. Read CONNACK (4 bytes expected)
     var connack: [4]u8 = undefined;
