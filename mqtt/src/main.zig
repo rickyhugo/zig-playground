@@ -5,79 +5,93 @@ const codec = @import("codec.zig");
 const mqtt = @import("mqtt.zig");
 
 pub fn main() !void {
-    // 1. TCP connect to localhost:1883
-
-    const stream = try net.tcpConnectToHost(std.heap.page_allocator, "localhost", 1883);
-    defer stream.close();
-
-    std.debug.print("Connected to broker\n", .{});
-
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const write_buf_size: u16 = 8192;
-    const write_buf = try allocator.alloc(u8, write_buf_size);
-    defer allocator.free(write_buf);
-
-    // const connect_packet = try codec.encodeConnect(
-    //     .mqtt_3_1_1,
-    //     write_buf,
-    //     .{ .client_id = "hugoplanet" },
-    // );
-    //
-    // try stream.writeAll(connect_packet);
-
     var client = try mqtt.Client311.init(.{
         .port = 1883,
         .host = "localhost",
-        // It IS possible to use the posix client without an allocator, see readme
         .allocator = allocator,
     });
+    defer client.deinit();
 
     _ = try client.connect(
         .{ .timeout = 2000 },
-        .{ .client_id = "my client" },
+        .{ .client_id = "hugoplanet" },
     );
 
-    // 3. Read CONNACK (4 bytes expected)
-    var connack: [4]u8 = undefined;
-    var total_read: usize = 0;
-    while (total_read < 4) {
-        const n = try stream.read(connack[total_read..]);
-        if (n == 0) return error.ConnectionClosed;
-        total_read += n;
-    }
-
-    // Validate CONNACK: 20 02 XX RC
-    if (connack[0] != 0x20 or connack[1] != 0x02) {
-        std.debug.print("Invalid CONNACK header: {x:0>2} {x:0>2}\n", .{ connack[0], connack[1] });
-        return error.InvalidConnack;
-    }
-
-    if (connack[3] != 0x00) {
-        std.debug.print("Connection refused, code: {d}\n", .{connack[3]});
-        return error.ConnectionRefused;
-    }
-
-    std.debug.print("CONNACK received, connected!\n", .{});
-
-    // 4. Send PUBLISH packet (QoS 0)
-    // Fixed header:     30 17 (PUBLISH QoS 0, remaining length 23)
-    // Topic:            00 0A "test/hello"
-    // Payload:          "hello world" (11 bytes, no length prefix for payload)
-    const publish_packet = [_]u8{
-        0x30, 0x17, // Fixed header (PUBLISH, QoS 0, remaining length 23)
-        0x00, 0x0A, 't', 'e', 's', 't', '/', 'h', 'e', 'l', 'l', 'o', // Topic
-        'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd', // Payload
+    if (try client.readPacket(.{})) |packet| switch (packet) {
+        .disconnect => |d| {
+            std.debug.print("server disconnected us: {s}", .{@tagName(d.reason_code)});
+            return;
+        },
+        .connack => {
+            // TODO: the connack packet can include server capabilities. We might care
+            // about these to tweak how our client behaves (like, what is the maximum
+            // supported QoS)
+            std.debug.print("connack: hugoplanet", .{});
+        },
+        else => {
+            // The server should not send any other type of packet at this point
+            // HOWEVER, we should probably handle this case better than an `unreachable`
+        },
     };
-    try stream.writeAll(&publish_packet);
 
-    std.debug.print("Published 'hello world' to 'test/hello'\n", .{});
+    var buf: [50]u8 = undefined;
+    for (5000..5003) |i| {
+        _ = try client.publish(
+            .{},
+            .{ .topic = "test/hello", .message = try std.fmt.bufPrint(&buf, "over {d}!", .{i}) },
+        );
 
-    // 5. Send DISCONNECT
-    const disconnect_packet = [_]u8{ 0xE0, 0x00 };
-    try stream.writeAll(&disconnect_packet);
+        std.Thread.sleep(std.time.ns_per_s);
+    }
 
-    std.debug.print("Disconnected cleanly\n", .{});
+    {
+        const packet_identifier = try client.subscribe(
+            .{},
+            .{ .topics = &.{.{ .filter = "test/receiver", .qos = .at_most_once }} },
+        );
+
+        if (try client.readPacket(.{})) |packet| switch (packet) {
+            .disconnect => |d| {
+                std.debug.print("server disconnected us: {s}", .{@tagName(d.reason_code)});
+                return;
+            },
+            .suback => |s| {
+                std.debug.assert(s.packet_identifier == packet_identifier);
+            },
+            else => {
+                // The server should not send any other type of packet at this point
+                // HOWEVER, we should probably handle this case better than an `unreachable`
+                unreachable;
+            },
+        };
+
+        var count: usize = 0;
+        loop: while (true) {
+            const packet = try client.readPacket(.{ .timeout = 1000 }) orelse {
+                std.debug.print("Still waiting for messages...\n", .{});
+                continue :loop;
+            };
+            switch (packet) {
+                .publish => |*publish| {
+                    std.debug.print("received\ntopic: {s}\n{s}\n\n", .{ publish.topic, publish.message });
+                    count += 1;
+                    if (count == 2) {
+                        // our publisher only sends 3 messages
+                        return;
+                    }
+                },
+                else => {
+                    // always have to be mindful of the bi-directional nature of MQTT
+                    // but in this case, nothing here should be possible.
+                    // client.readPacket handles `disconnect` and our above connect and
+                    // subscribe should have handled their corresponing connack and suback
+                    std.debug.print("unexpected packet: {any}\n", .{packet});
+                },
+            }
+        }
+    }
 }

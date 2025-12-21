@@ -4,6 +4,7 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
 const codec = @import("codec.zig");
+const packets = @import("packets.zig");
 
 pub const ProtocolVersion = union(enum) {
     mqtt_5_0: void,
@@ -33,6 +34,89 @@ pub const PayloadFormat = enum(u1) {
     utf8 = 1,
 };
 
+pub const RetainHandling = enum(u2) {
+    send_retained_on_subscribe = 0,
+    send_retained_on_new_subscribe = 1,
+    do_not_send_retained = 2,
+};
+
+// MQTT has ~128 error reasons, here they are.
+pub const ErrorReasonCode = enum {
+    unknown,
+    unspecified_error,
+    malformed_packet,
+    protocol_error,
+    implementation_specific_error,
+    unsupported_protocol_version,
+    client_identifier_not_valid,
+    bad_user_name_or_password,
+    not_authorized,
+    server_unavailable,
+    server_busy,
+    banned,
+    server_shutting_down,
+    bad_authentication_method,
+    keep_alive_timeout,
+    session_taken_over,
+    topic_filter_invalid,
+    topic_name_invalid,
+    packet_identifier_in_use,
+    packet_identifier_not_found,
+    receive_maximum_exceeded,
+    topic_alias_invalid,
+    packet_too_large,
+    message_rate_too_high,
+    quota_exceeded,
+    administrative_action,
+    payload_format_invalid,
+    retain_not_supported,
+    qos_not_supported,
+    use_another_server,
+    server_moved,
+    shared_subscriptions_not_supported,
+    connection_rate_exceeded,
+    maximum_connect_time,
+    subscription_identifiers_not_supported,
+    wildcard_subscriptions_not_supported,
+};
+
+// When disconnecting, we give the server one of these reasons.
+pub const ClientDisconnectReason = enum(u8) {
+    normal = 0,
+    disconnect_with_will_message = 4,
+    unspecified_error = 128,
+    malformed_packet = 129,
+    protocol_error = 130,
+    implementation_specific_error = 131,
+    topic_name_invalid = 144,
+    receive_maximum_exceeded = 147,
+    topic_alias_invalid = 148,
+    packet_too_large = 149,
+    message_rate_too_high = 150,
+    quota_exceeded = 151,
+    administrative_action = 152,
+    payload_format_invalid = 153,
+};
+
+pub const PubAckReason = enum(u8) {
+    success = 0,
+    no_matching_subscribers = 16,
+    unspecified_error = 128,
+    implementation_specific_error = 131,
+    not_authorized = 135,
+    topic_name_invalid = 144,
+    packet_identifier_in_use = 145,
+    quota_exceeded = 151,
+    payload_format_invalid = 153,
+};
+pub const PubRecReason = PubAckReason;
+
+pub const PubRelReason = enum(u8) {
+    success = 0,
+    packet_identifier_not_found = 146,
+};
+pub const PubCompReason = PubRelReason;
+
 pub const ConnectOpts = struct {
     client_id: ?[]const u8 = null,
     username: ?[]const u8 = null,
@@ -58,11 +142,86 @@ pub const ConnectOpts = struct {
     };
 };
 
-const Address = struct {
-    // null when we're given an ip:port.
-    host: ?Host = null,
+pub const DisconnectOpts = struct {
+    reason: ClientDisconnectReason,
+    session_expiry_interval: ?u32 = null,
+    reason_string: ?[]const u8 = null,
+    user_properties: ?[]const UserProperty = null,
+};
 
-    // initially null when we're given a host:port
+pub const SubscribeOpts = struct {
+    packet_identifier: ?u16 = null,
+    subscription_identifier: ?usize = null,
+    topics: []const Topic,
+    user_properties: ?[]const UserProperty = null,
+
+    pub const Topic = struct {
+        filter: []const u8,
+        qos: QoS = .at_most_once,
+        no_local: bool = true,
+        retain_as_published: bool = false,
+        retain_handling: RetainHandling = .do_not_send_retained,
+    };
+};
+
+pub const UnsubscribeOpts = struct {
+    packet_identifier: ?u16 = null,
+    topics: []const []const u8,
+};
+
+pub const PublishOpts = struct {
+    topic: []const u8,
+    message: []const u8,
+    dup: bool = false,
+    qos: QoS = .at_most_once,
+    retain: bool = false,
+    packet_identifier: ?u16 = null,
+    payload_format: ?PayloadFormat = null,
+    message_expiry_interval: ?u32 = null,
+    topic_alias: ?u16 = null,
+    response_topic: ?[]const u8 = null,
+    correlation_data: ?[]const u8 = null,
+    subscription_identifier: ?usize = null,
+    content_type: ?[]const u8 = null,
+    user_properties: ?[]const UserProperty = null,
+};
+
+pub const PubAckOpts = struct {
+    packet_identifier: u16,
+    reason_code: PubAckReason = .success,
+    reason_string: ?[]const u8 = null,
+    user_properties: ?[]const UserProperty = null,
+};
+
+pub const PubRecOpts = struct {
+    packet_identifier: u16,
+    reason_code: PubRecReason = .success,
+    reason_string: ?[]const u8 = null,
+    user_properties: ?[]const UserProperty = null,
+};
+
+pub const PubRelOpts = struct {
+    packet_identifier: u16,
+    reason_code: PubRelReason = .success,
+    reason_string: ?[]const u8 = null,
+    user_properties: ?[]const UserProperty = null,
+};
+
+pub const PubCompOpts = struct {
+    packet_identifier: u16,
+    reason_code: PubCompReason = .success,
+    reason_string: ?[]const u8 = null,
+    user_properties: ?[]const UserProperty = null,
+};
+
+pub const ErrorDetail = union(enum) {
+    inner: anyerror,
+    details: []const u8,
+    reason: ErrorReasonCode,
+};
+
+const Address = struct {
+    host: ?Host = null,
     address: ?net.Address = null,
 
     const Host = struct {
@@ -77,7 +236,6 @@ const Address = struct {
     ) !Address {
         if (optional_ip) |ip| {
             return .{
-                // setting a future resolved means, on connect/reconnect we won't try to
                 .address = try std.net.Address.parseIp(ip, port),
             };
         }
@@ -92,7 +250,6 @@ const Address = struct {
         timeout: i32,
     ) !posix.socket_t {
         if (self.address) |addr| {
-            // we were given an ip:port, so the address is fixed
             return connectTo(addr, timeout);
         }
 
@@ -165,6 +322,9 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
         // pickup DNS changes on reconnect.
         address: Address,
 
+        read_pos: usize,
+        read_len: usize,
+
         // if we own the read_buffer, it's our job to free it on deinit
         read_buf_own: bool,
         read_buf: []u8,
@@ -183,6 +343,19 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
 
         default_retries: u16,
         default_timeout: i32,
+
+        // Many packets take an identifier, we increment this by one on each call
+        packet_identifier: u16,
+
+        // Default to true, but might be set to false as a property to connack.
+        // If it does get set to false, we'll error on any publish where retain = true
+        server_can_retain: bool,
+
+        // If, in connack, the server tells us its maximum supported QoS, we'll
+        // reject any publish with a higher QoS.
+        server_max_qos: u2,
+
+        last_error: ?ErrorDetail,
 
         pub const Opts = struct {
             port: u16,
@@ -243,6 +416,8 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
                 .socket = null,
                 .address = address,
                 .allocator = allocator,
+                .read_pos = 0,
+                .read_len = 0,
                 .read_buf_own = read_buf_own,
                 .read_buf = read_buf.?,
                 .write_buf_own = write_buf_own,
@@ -250,6 +425,10 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
                 .connect_timeout = opts.connect_timeout,
                 .default_retries = opts.default_retries orelse 1,
                 .default_timeout = opts.default_timeout orelse 5_000,
+                .packet_identifier = 1,
+                .server_can_retain = true,
+                .server_max_qos = @intFromEnum(QoS.exactly_once),
+                .last_error = null,
             };
         }
 
@@ -263,14 +442,86 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
         pub fn deinit(self: *Self) void {
             self.close();
 
-            const allocator = self.allocator;
             if (self.read_buf_own) {
-                allocator.?.free(self.mqtt.read_buf);
+                self.allocator.?.free(self.read_buf);
             }
 
             if (self.write_buf_own) {
-                allocator.?.free(self.mqtt.write_buf);
+                self.allocator.?.free(self.write_buf);
             }
+        }
+
+        pub fn publish(
+            self: *Self,
+            rw: ReadWriteOpts,
+            opts: PublishOpts,
+        ) !?u16 {
+            if (opts.retain == true and self.server_can_retain == false) {
+                self.last_error = .{ .details = "server does not support retained messages" };
+                return error.Usage;
+            }
+            if (@intFromEnum(opts.qos) > self.server_max_qos) {
+                self.last_error = .{ .details = "server does not support this level of QoS" };
+                return error.Usage;
+            }
+
+            var packet_identifier: ?u16 = null;
+            if (opts.qos != .at_most_once) {
+                // when QoS > 0, we include a packet identifier
+                packet_identifier = self.packetIdentifier(opts.packet_identifier);
+            }
+
+            const publish_packet = try codec.encodePublish(
+                self.write_buf,
+                protocol_version,
+                packet_identifier,
+                opts,
+            );
+
+            try self.write(&self.createContext(rw), publish_packet);
+            return packet_identifier;
+        }
+
+        pub fn subscribe(
+            self: *Self,
+            rw: ReadWriteOpts,
+            opts: SubscribeOpts,
+        ) !u16 {
+            if (opts.topics.len == 0) {
+                self.last_error = .{ .details = "must have at least 1 topic" };
+                return error.Usage;
+            }
+
+            const packet_identifier = self.packetIdentifier(opts.packet_identifier);
+            const subscribe_packet = try codec.encodeSubscribe(
+                self.write_buf,
+                protocol_version,
+                packet_identifier,
+                opts,
+            );
+            try self.write(&self.createContext(rw), subscribe_packet);
+            return packet_identifier;
+        }
+
+        pub fn unsubscribe(
+            self: *Self,
+            rw: ReadWriteOpts,
+            opts: UnsubscribeOpts,
+        ) !u16 {
+            if (opts.topics.len == 0) {
+                self.last_error = .{ .details = "must have at least 1 topic" };
+                return error.Usage;
+            }
+
+            const packet_identifier = self.packetIdentifier(opts.packet_identifier);
+            const unsubscribe_packet = try codec.encodeUnsubscribe(
+                self.write_buf,
+                protocol_version,
+                packet_identifier,
+                opts,
+            );
+            try self.write(&self.createContext(rw), unsubscribe_packet);
+            return packet_identifier;
         }
 
         const Context = struct {
@@ -292,7 +543,43 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
                 opts,
             );
 
-            try self.writePacket(&self.createContext(rw), connect_packet);
+            try self.write(&self.createContext(rw), connect_packet);
+        }
+
+        pub fn disconnect(
+            self: *Self,
+            rw: ReadWriteOpts,
+            opts: DisconnectOpts,
+        ) !void {
+            if (self.socket == null) {
+                return;
+            }
+
+            // copy so we can mutate
+            var rw_copy = rw;
+            if (rw.retries == null) {
+                // unless a retry is explicit set, let's override the default, since we
+                // don't want to reconnect just to disconnect.
+                rw_copy.retries = 0;
+            }
+
+            defer self.close();
+
+            const disconnect_packet = try codec.encodeDisconnect(
+                self.write_buf,
+                protocol_version,
+                opts,
+            );
+            return self.write(&self.createContext(rw), disconnect_packet);
+        }
+
+        fn packetIdentifier(self: *Self, explicit: ?u16) u16 {
+            if (explicit) |pi| {
+                return pi;
+            }
+            const pi = self.packet_identifier +% 1;
+            self.packet_identifier = pi;
+            return pi;
         }
 
         fn getOrConnectSocket(self: *Self) !posix.socket_t {
@@ -319,7 +606,145 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
             return socket;
         }
 
-        pub fn readPacket(self: *Self, ctx: *const Context, buf: []u8, _: usize) !?usize {
+        pub fn readPacket(self: *Self, rw: ReadWriteOpts) !?packets.Packet {
+            var ctx = self.createContext(rw);
+
+            const p = (try self.readOrBuffered(&ctx)) orelse return null;
+            switch (p) {
+                .connack => |*connack| try self.processConnack(&ctx, connack),
+                else => {},
+            }
+            return p;
+        }
+
+        fn processConnack(
+            self: *Self,
+            ctx: *Context,
+            connack: *const packets.Packet.ConnAck,
+        ) !void {
+            if (connack.session_present) {
+                self.disconnect(
+                    .{ .retries = ctx.retries, .timeout = ctx.timeout },
+                    .{ .reason = .protocol_error },
+                ) catch {};
+
+                self.last_error = .{
+                    .details = "connack indicated the presence of a session despite requesting clean_start",
+                };
+
+                return error.Protocol;
+            }
+
+            if (connack.retain_available) |ra| {
+                self.server_can_retain = ra;
+            }
+
+            if (connack.maximum_qos) |max| {
+                self.server_max_qos = @intFromEnum(max);
+            }
+        }
+
+        fn readOrBuffered(self: *Self, ctx: *Context) !?packets.Packet {
+            if (try self.bufferedPacket()) |buffered_packet| {
+                return buffered_packet;
+            }
+
+            var buf = self.read_buf;
+            var pos = self.read_len;
+
+            if (pos > 0 and pos == self.read_pos) {
+                // optimize, our last readPacket read exactly 1 packet
+                // we can reset all our indexes to 0 so that we have the full buffer
+                // available
+                pos = 0;
+                self.read_pos = 0;
+                self.read_len = 0;
+            }
+
+            var calls: usize = 1;
+            while (true) {
+                if (pos == buf.len) {
+                    const read_pos = self.read_pos;
+                    // we have no more space in our buffer ...
+                    if (read_pos == 0) {
+                        // ... and we started reading this packet from the start of our
+                        // buffer, so we really have no more space
+                        return error.ReadBufferIsFull;
+                    }
+
+                    // ... and we didn't start reading this message from the start of our
+                    // buffer, so if we move things around, we'll have new free space.
+
+                    // std.mem.copyForward. can't use @memcpy because these potentially overlap
+                    pos = self.read_len - read_pos;
+                    for (buf[0..pos], buf[read_pos..]) |*d, s| {
+                        d.* = s;
+                    }
+                    self.read_pos = 0;
+                    self.read_len = pos;
+                }
+
+                const n = (try self.read(ctx, buf[pos..], calls)) orelse return null;
+                if (n == 0) {
+                    return error.Closed;
+                }
+
+                pos += n;
+                self.read_len += n;
+
+                // bufferedPacket() will set read_pos
+                if (try self.bufferedPacket()) |p| {
+                    return p;
+                }
+
+                calls += 1;
+            }
+        }
+
+        // see if we have a full packet in our read_buf already
+        fn bufferedPacket(self: *Self) !?packets.Packet {
+            const buf = self.read_buf[self.read_pos..self.read_len];
+
+            // always has to be at least 2 bytes
+            //  1 for the packet type and at least 1 for the length.
+            if (buf.len < 2) {
+                return null;
+            }
+
+            const remaining_len, const length_of_len = codec.readVarint(
+                buf[1..],
+            ) catch |err| switch (err) {
+                error.InvalidVarint => {
+                    self.last_error = .{ .inner = err };
+                    return error.MalformedPacket;
+                },
+            } orelse return null;
+
+            // +1 for the packet type
+            const fixed_header_len = 1 + length_of_len;
+
+            const total_len = fixed_header_len + remaining_len;
+            if (buf.len < total_len) {
+                // don't have a full packet yet
+                return null;
+            }
+
+            self.read_pos += total_len;
+            return packets.Packet.decode(
+                buf[0],
+                buf[fixed_header_len..total_len],
+                protocol_version,
+            ) catch |err| {
+                self.last_error = .{ .inner = err };
+                switch (err) {
+                    error.UnknownPacketType => return error.Protocol,
+                    error.InvalidReasonCode => return error.Protocol,
+                    else => return error.MalformedPacket,
+                }
+            };
+        }
+
+        pub fn read(self: *Self, ctx: *const Context, buf: []u8, _: usize) !?usize {
             const absolute_timeout = std.time.milliTimestamp() + ctx.timeout;
 
             // on disconnect, the number of times that we'll try to reconnect and
@@ -329,6 +754,7 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
             // If retries > 0 and we detect a disconnect, we'll attempt to reload the
             // socket (hence socket is var, not const).
             var socket = try self.getOrConnectSocket();
+
             loop: while (true) {
                 const n = posix.read(socket, buf) catch |err| {
                     switch (err) {
@@ -342,7 +768,12 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
                                 return null;
                             }
 
-                            var fds = [1]posix.pollfd{.{ .fd = socket, .events = posix.POLL.IN, .revents = 0 }};
+                            var fds = [1]posix.pollfd{.{
+                                .fd = socket,
+                                .events = posix.POLL.IN,
+                                .revents = 0,
+                            }};
+
                             if (try posix.poll(&fds, timeout) == 0) {
                                 return null;
                             }
@@ -372,7 +803,7 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
             }
         }
 
-        pub fn writePacket(self: *Self, ctx: *const Context, data: []const u8) !void {
+        pub fn write(self: *Self, ctx: *const Context, data: []const u8) !void {
             const absolute_timeout = std.time.milliTimestamp() + ctx.timeout;
 
             // on disconnect, the number of times that we'll try to reconnect and
@@ -400,6 +831,7 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
                             .events = posix.POLL.OUT,
                             .revents = 0,
                         }};
+
                         if (try posix.poll(&fds, timeout) == 0) {
                             return error.Timeout;
                         }
