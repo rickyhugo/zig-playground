@@ -524,6 +524,19 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
             return packet_identifier;
         }
 
+        pub fn puback(
+            self: *Self,
+            rw: ReadWriteOpts,
+            opts: PubAckOpts,
+        ) !void {
+            const puback_packet = try codec.encodePubAck(
+                self.write_buf,
+                protocol_version,
+                opts,
+            );
+            try self.write(&self.createContext(rw), puback_packet);
+        }
+
         const Context = struct {
             retries: u16 = 1,
             timeout: i32 = 10_000,

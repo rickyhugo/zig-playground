@@ -214,7 +214,6 @@ pub fn encodePublish(
     packet_identifier: ?u16,
     opts: mqtt.PublishOpts,
 ) ![]u8 {
-    // Validate that no MQTT 5.0 properties are used in strict 3.1.1 mode
     if (comptime protocol_version == .mqtt_3_1_1) {
         try validatePublishOptsFor311(opts);
     }
@@ -259,7 +258,6 @@ pub fn encodeSubscribe(
     packet_identifier: u16,
     opts: mqtt.SubscribeOpts,
 ) ![]u8 {
-    // Validate that no MQTT 5.0 properties are used in strict 3.1.1 mode
     if (comptime protocol_version == .mqtt_3_1_1) {
         try validateSubscribeOptsFor311(opts);
     }
@@ -329,12 +327,35 @@ pub fn encodeUnsubscribe(
     return encodePacketHeader(buf[0..pos], 10, 2);
 }
 
+pub fn encodePubAck(
+    buf: []u8,
+    comptime protocol_version: mqtt.ProtocolVersion,
+    opts: mqtt.PubAckOpts,
+) ![]u8 {
+    if (comptime protocol_version == .mqtt_3_1_1) {
+        try validatePubAckOptsFor311(opts);
+    }
+
+    // reserve 1 byte for the packet type
+    // reserve 4 bytes for the packet length (which might be less than 4 bytes)
+    writeInt(u16, buf[5..7], opts.packet_identifier);
+
+    // MQTT 3.1.1: only packet identifier (2 bytes)
+    if (comptime protocol_version == .mqtt_3_1_1) {
+        buf[3] = 64; // packet type (0100) + flags (0000)
+        buf[4] = 2; // remaining length
+        return buf[3..7];
+    }
+
+    // TODO: implement v5
+    unreachable;
+}
+
 pub fn encodeDisconnect(
     buf: []u8,
     comptime protocol_version: mqtt.ProtocolVersion,
     opts: mqtt.DisconnectOpts,
 ) ![]u8 {
-    // Validate that no MQTT 5.0 properties are used in strict 3.1.1 mode
     if (comptime protocol_version == .mqtt_3_1_1) {
         try validateDisconnectOptsFor311(opts);
     }
@@ -388,6 +409,11 @@ fn validateSubscribeOptsFor311(opts: mqtt.SubscribeOpts) Mqtt311Error!void {
         if (topic.retain_as_published != false) return error.UnsupportedPropertyForMqtt311;
         if (topic.retain_handling != .do_not_send_retained) return error.UnsupportedPropertyForMqtt311;
     }
+}
+
+fn validatePubAckOptsFor311(opts: mqtt.PubAckOpts) Mqtt311Error!void {
+    if (opts.reason_string != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.user_properties != null) return error.UnsupportedPropertyForMqtt311;
 }
 
 fn validateDisconnectOptsFor311(opts: mqtt.DisconnectOpts) Mqtt311Error!void {
