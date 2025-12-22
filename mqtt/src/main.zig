@@ -51,7 +51,7 @@ pub fn main() !void {
     {
         const packet_identifier = try client.subscribe(
             .{},
-            .{ .topics = &.{.{ .filter = "test/receiver", .qos = .at_most_once }} },
+            .{ .topics = &.{.{ .filter = "test/receiver", .qos = .at_least_once }} },
         );
 
         if (try client.readPacket(.{})) |packet| switch (packet) {
@@ -77,10 +77,11 @@ pub fn main() !void {
             };
             switch (packet) {
                 .publish => |*publish| {
+                    try client.puback(.{}, .{ .packet_identifier = publish.packet_identifier.? });
+
                     std.debug.print("received\ntopic: {s}\n{s}\n\n", .{ publish.topic, publish.message });
                     count += 1;
                     if (count == 2) {
-                        // our publisher only sends 3 messages
                         return;
                     }
                 },

@@ -4,7 +4,7 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
 const codec = @import("codec.zig");
-const packets = @import("packets.zig");
+const Packet = @import("packets.zig").Packet;
 
 pub const ProtocolVersion = union(enum) {
     mqtt_5_0: void,
@@ -619,7 +619,7 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
             return socket;
         }
 
-        pub fn readPacket(self: *Self, rw: ReadWriteOpts) !?packets.Packet {
+        pub fn readPacket(self: *Self, rw: ReadWriteOpts) !?Packet {
             var ctx = self.createContext(rw);
 
             const p = (try self.readOrBuffered(&ctx)) orelse return null;
@@ -633,7 +633,7 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
         fn processConnack(
             self: *Self,
             ctx: *Context,
-            connack: *const packets.Packet.ConnAck,
+            connack: *const Packet.ConnAck,
         ) !void {
             if (connack.session_present) {
                 self.disconnect(
@@ -657,7 +657,7 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
             }
         }
 
-        fn readOrBuffered(self: *Self, ctx: *Context) !?packets.Packet {
+        fn readOrBuffered(self: *Self, ctx: *Context) !?Packet {
             if (try self.bufferedPacket()) |buffered_packet| {
                 return buffered_packet;
             }
@@ -715,7 +715,7 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
         }
 
         // see if we have a full packet in our read_buf already
-        fn bufferedPacket(self: *Self) !?packets.Packet {
+        fn bufferedPacket(self: *Self) !?Packet {
             const buf = self.read_buf[self.read_pos..self.read_len];
 
             // always has to be at least 2 bytes
@@ -743,7 +743,7 @@ pub fn Client(comptime protocol_version: ProtocolVersion) type {
             }
 
             self.read_pos += total_len;
-            return packets.Packet.decode(
+            return Packet.decode(
                 buf[0],
                 buf[fixed_header_len..total_len],
                 protocol_version,
