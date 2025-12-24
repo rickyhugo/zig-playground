@@ -195,15 +195,6 @@ pub const Client = struct {
     // Many packets take an identifier, we increment this by one on each call
     packet_identifier: u16,
 
-    // Default to true. In MQTT 3.1.1, the broker doesn't indicate this
-    // in connack, so we assume retained messages are supported.
-    // If the server rejects a retained publish, we'll need to handle that error.
-    server_can_retain: bool,
-
-    // If, in connack, the server tells us its maximum supported QoS, we'll
-    // reject any publish with a higher QoS.
-    server_max_qos: u2,
-
     last_error: ?ErrorDetail,
 
     pub const Opts = struct {
@@ -274,9 +265,7 @@ pub const Client = struct {
             .connect_timeout = opts.connect_timeout,
             .default_retries = opts.default_retries orelse 1,
             .default_timeout = opts.default_timeout orelse 5_000,
-            .packet_identifier = 1,
-            .server_can_retain = true,
-            .server_max_qos = @intFromEnum(QoS.exactly_once),
+            .packet_identifier = 0,
             .last_error = null,
         };
     }
@@ -331,15 +320,6 @@ pub const Client = struct {
     }
 
     pub fn publish(self: *Self, rw: ReadWriteOpts, opts: PublishOpts) !?u16 {
-        if (opts.retain == true and self.server_can_retain == false) {
-            self.last_error = .{ .details = "server does not support retained messages" };
-            return error.Usage;
-        }
-        if (@intFromEnum(opts.qos) > self.server_max_qos) {
-            self.last_error = .{ .details = "server does not support this level of QoS" };
-            return error.Usage;
-        }
-
         var packet_identifier: ?u16 = null;
         if (opts.qos != .at_most_once) {
             // when QoS > 0, we include a packet identifier
@@ -396,7 +376,7 @@ pub const Client = struct {
         defer self.close();
 
         const disconnect_packet = try codec.encodeDisconnect(self.write_buf);
-        return self.write(&self.createContext(rw), disconnect_packet);
+        return self.write(&self.createContext(rw_copy), disconnect_packet);
     }
 
     pub fn lastError(self: *const Self) ?ErrorDetail {
@@ -475,6 +455,24 @@ pub const Client = struct {
         ctx: *Context,
         connack: *const Packet.ConnAck,
     ) !void {
+        // Check if connection was rejected
+        if (connack.return_code != .accepted) {
+            self.close();
+
+            self.last_error = .{
+                .details = switch (connack.return_code) {
+                    .accepted => unreachable,
+                    .unacceptable_protocol_version => "connection refused: unacceptable protocol version",
+                    .identifier_rejected => "connection refused: client identifier rejected",
+                    .server_unavailable => "connection refused: server unavailable",
+                    .bad_username_or_password => "connection refused: bad username or password",
+                    .not_authorized => "connection refused: not authorized",
+                },
+            };
+
+            return error.ConnectionRefused;
+        }
+
         // In MQTT 3.1.1, we always request clean_session=true, so session_present
         // should always be false. If it's true, that's a protocol error.
         if (connack.session_present) {
@@ -505,7 +503,6 @@ pub const Client = struct {
             self.read_len = 0;
         }
 
-        var calls: usize = 1;
         while (true) {
             if (pos == buf.len) {
                 const read_pos = self.read_pos;
@@ -528,7 +525,7 @@ pub const Client = struct {
                 self.read_len = pos;
             }
 
-            const n = (try self.read(ctx, buf[pos..], calls)) orelse return null;
+            const n = (try self.read(ctx, buf[pos..])) orelse return null;
             if (n == 0) {
                 return error.Closed;
             }
@@ -540,8 +537,6 @@ pub const Client = struct {
             if (try self.bufferedPacket()) |p| {
                 return p;
             }
-
-            calls += 1;
         }
     }
 
@@ -550,7 +545,7 @@ pub const Client = struct {
         const buf = self.read_buf[self.read_pos..self.read_len];
 
         // always has to be at least 2 bytes
-        //  1 for the packet type and at least 1 for the length.
+        // 1 for the packet type and at least 1 for the length.
         if (buf.len < 2) {
             return null;
         }
@@ -584,7 +579,7 @@ pub const Client = struct {
         };
     }
 
-    fn read(self: *Self, ctx: *const Context, buf: []u8, _: usize) !?usize {
+    fn read(self: *Self, ctx: *const Context, buf: []u8) !?usize {
         const absolute_timeout = std.time.milliTimestamp() + ctx.timeout;
 
         // on disconnect, the number of times that we'll try to reconnect and
@@ -661,7 +656,7 @@ pub const Client = struct {
         loop: while (pos < data.len) {
             pos += posix.write(socket, data[pos..]) catch |err| switch (err) {
                 error.WouldBlock => {
-                    const timeout: i32 = @intCast(std.time.milliTimestamp() - absolute_timeout);
+                    const timeout: i32 = @intCast(absolute_timeout - std.time.milliTimestamp());
                     if (timeout < 0) {
                         return error.Timeout;
                     }

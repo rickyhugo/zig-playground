@@ -33,11 +33,12 @@ pub fn main() !void {
             // TODO: the connack packet can include server capabilities. We might care
             // about these to tweak how our client behaves (like, what is the maximum
             // supported QoS)
-            std.debug.print("connack: hugoplanet", .{});
+            std.debug.print("connack: hugoplanet\n", .{});
         },
         else => {
             // The server should not send any other type of packet at this point
             // HOWEVER, we should probably handle this case better than an `unreachable`
+            std.debug.print("unreachable; readPacket", .{});
         },
     };
 
@@ -45,7 +46,12 @@ pub fn main() !void {
     for (5000..5003) |i| {
         _ = try client.publish(
             .{},
-            .{ .topic = "test/hello", .message = try std.fmt.bufPrint(&buf, "over {d}!", .{i}) },
+            .{
+                .qos = .at_least_once,
+                .retain = true,
+                .topic = "test/hello",
+                .message = try std.fmt.bufPrint(&buf, "over {d}!", .{i}),
+            },
         );
 
         std.Thread.sleep(std.time.ns_per_s);
@@ -65,10 +71,14 @@ pub fn main() !void {
             .suback => |s| {
                 std.debug.assert(s.packet_identifier == packet_identifier);
             },
-            else => {
+            .puback => |p| {
+                std.debug.print("pub in sub: {}\n", .{p});
+            },
+
+            else => |err| {
                 // The server should not send any other type of packet at this point
                 // HOWEVER, we should probably handle this case better than an `unreachable`
-                unreachable;
+                std.debug.print("unreachable; readPacket: {}\n", .{err});
             },
         };
 
@@ -88,6 +98,12 @@ pub fn main() !void {
                     if (count == 2) {
                         return;
                     }
+                },
+                .puback => |puback| {
+                    std.debug.print("puback read: {}\n", .{puback});
+                },
+                .suback => |suback| {
+                    std.debug.print("suback read: {}\n", .{suback});
                 },
                 else => {
                     // always have to be mindful of the bi-directional nature of MQTT

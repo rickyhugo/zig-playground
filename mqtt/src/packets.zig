@@ -33,20 +33,24 @@ pub const Packet = union(enum) {
         packet_identifier: u16,
         results: []const u8,
 
-        const Error = error{
+        pub const Error = error{
+            OutOfBounds,
             Failure,
             Protocol,
         };
 
-        pub fn result(self: *const SubAck, topic_index: usize) SubAck.Error!mqtt.QoS {
-            const results = self.results;
-
-            switch (results[topic_index]) {
-                0 => return .at_most_once,
-                1 => return .at_least_once,
-                2 => return .exactly_once,
-                else => return error.Protocol,
+        pub fn result(self: *const SubAck, topic_index: usize) Error!mqtt.QoS {
+            if (topic_index >= self.results.len) {
+                return error.OutOfBounds;
             }
+
+            return switch (self.results[topic_index]) {
+                0 => .at_most_once,
+                1 => .at_least_once,
+                2 => .exactly_once,
+                128 => error.Failure,
+                else => error.Protocol,
+            };
         }
     };
 
@@ -62,7 +66,7 @@ pub const Packet = union(enum) {
 
         topic: []const u8,
         message: []const u8,
-        // null when qos is .at_least_once
+        // null when qos is .at_most_once
         packet_identifier: ?u16,
     };
 
@@ -91,8 +95,6 @@ pub const Packet = union(enum) {
     pub const Disconnect = struct {};
 
     pub fn decode(b1: u8, data: []u8) !Packet {
-        // data.len has to be > 0
-        // TODO: how to assert without std?
         const flags: u4 = @intCast(b1 & 15);
         switch (b1 >> 4) {
             2 => return .{ .connack = try decodeConnAck(data, flags) },
@@ -105,7 +107,7 @@ pub const Packet = union(enum) {
             11 => return .{ .unsuback = try decodeUnsubAck(data, flags) },
             13 => return if (flags == 0) .{ .pong = {} } else error.InvalidFlags,
             14 => return .{ .disconnect = try decodeDisconnect(data, flags) },
-            else => return error.UnknownPacketType, // TODO
+            else => return error.UnknownPacketType,
         }
     }
 };
@@ -205,6 +207,11 @@ fn decodePublish(data: []u8, flags: u4) !Packet.Publish {
     };
 
     if (publish.qos != .at_most_once) {
+        // QoS 1 and 2 require a 2-byte packet identifier after the topic
+        if (data.len < message_offset + 2) {
+            return error.IncompletePacket;
+        }
+
         const packet_identifier_offset = message_offset;
         message_offset += 2;
         publish.packet_identifier = codec.readInt(

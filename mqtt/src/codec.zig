@@ -32,10 +32,10 @@ pub fn readString(buf: []const u8) error{InvalidString}!struct { []const u8, usi
     return .{ buf[2..end], end };
 }
 
-pub fn writeString(buf: []u8, value: []const u8) error{WriteBufferIsFull}!usize {
+pub fn writeString(buf: []u8, value: []const u8) error{WriteBufferFull}!usize {
     const total = value.len + 2;
     if (buf.len < total) {
-        return error.WriteBufferIsFull;
+        return error.WriteBufferFull;
     }
 
     writeInt(u16, buf[0..2], @intCast(value.len));
@@ -43,12 +43,7 @@ pub fn writeString(buf: []u8, value: []const u8) error{WriteBufferIsFull}!usize 
     return total;
 }
 
-pub const WriteVarintError = error{
-    WriteBufferFull,
-    ValueTooLarge,
-};
-
-pub fn writeVarint(buf: []u8, len: usize) WriteVarintError!usize {
+pub fn writeVarint(buf: []u8, len: usize) error{ WriteBufferFull, ValueTooLarge }!usize {
     if (len > 268_435_455) return error.ValueTooLarge;
 
     var i: usize = 0;
@@ -168,9 +163,9 @@ pub fn encodeConnect(buf: []u8, opts: mqtt.ConnectOpts) ![]u8 {
 
     writeInt(u16, buf[13..15], opts.keepalive_sec);
 
-    const PROPERTIES_OFFSET = 15;
+    const PAYLOAD_OFFSET = 15;
 
-    var pos: usize = PROPERTIES_OFFSET;
+    var pos: usize = PAYLOAD_OFFSET;
     pos += try writeString(buf[pos..], opts.client_id orelse "");
 
     if (opts.will) |will| {
@@ -198,11 +193,10 @@ pub fn encodeSubscribe(
     // reserve 4 bytes for the packet length (which might be less than 4 bytes)
     writeInt(u16, buf[5..7], packet_identifier);
 
-    const PROPERTIES_OFFSET = 7;
-    var pos: usize = PROPERTIES_OFFSET;
+    const PAYLOAD_OFFSET = 7;
+    var pos: usize = PAYLOAD_OFFSET;
     for (opts.topics) |topic| {
         pos += try writeString(buf[pos..], topic.filter);
-        // MQTT 3.1.1: just QoS byte
         buf[pos] = @intFromEnum(topic.qos);
         pos += 1;
     }
@@ -219,8 +213,8 @@ pub fn encodeUnsubscribe(
     // reserve 4 bytes for the packet length (which might be less than 4 bytes)
     writeInt(u16, buf[5..7], packet_identifier);
 
-    const PROPERTIES_OFFSET = 7;
-    var pos = PROPERTIES_OFFSET;
+    const PAYLOAD_OFFSET = 7;
+    var pos = PAYLOAD_OFFSET;
     for (opts.topics) |topic| {
         pos += try writeString(buf[pos..], topic);
     }
@@ -244,19 +238,19 @@ pub fn encodePublish(
     const VARIABLE_HEADER_OFFSET = 5;
     const topic_len = try writeString(buf[VARIABLE_HEADER_OFFSET..], opts.topic);
 
-    var properties_offset = VARIABLE_HEADER_OFFSET + topic_len;
+    var payload_offset = VARIABLE_HEADER_OFFSET + topic_len;
     if (packet_identifier) |pi| {
-        const packet_identifier_offset = properties_offset;
-        properties_offset += 2;
-        writeInt(u16, buf[packet_identifier_offset..properties_offset][0..2], pi);
+        const packet_identifier_offset = payload_offset;
+        payload_offset += 2;
+        writeInt(u16, buf[packet_identifier_offset..payload_offset][0..2], pi);
     }
 
-    const payload_offset = properties_offset;
     const message = opts.message;
     const end = payload_offset + message.len;
     if (end > buf.len) {
-        return error.WriteBufferIsFull;
+        return error.WriteBufferFull;
     }
+
     @memcpy(buf[payload_offset..end], message);
     return encodePacketHeader(buf[0..end], 3, @as(u4, @bitCast(publish_flags)));
 }
