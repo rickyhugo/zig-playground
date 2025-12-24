@@ -9,7 +9,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var client = try mqtt.Client311.init(.{
+    var client = try mqtt.Client.init(.{
         .port = 1883,
         .host = "localhost",
         .allocator = allocator,
@@ -22,8 +22,8 @@ pub fn main() !void {
     );
 
     if (try client.readPacket(.{})) |packet| switch (packet) {
-        .disconnect => |d| {
-            std.debug.print("server disconnected us: {s}", .{@tagName(d.reason_code)});
+        .disconnect => {
+            std.debug.print("server disconnected us", .{});
             return;
         },
         .connack => {
@@ -55,8 +55,8 @@ pub fn main() !void {
         );
 
         if (try client.readPacket(.{})) |packet| switch (packet) {
-            .disconnect => |d| {
-                std.debug.print("server disconnected us: {s}", .{@tagName(d.reason_code)});
+            .disconnect => {
+                std.debug.print("server disconnected us", .{});
                 return;
             },
             .suback => |s| {
@@ -75,6 +75,7 @@ pub fn main() !void {
                 std.debug.print("Still waiting for messages...\n", .{});
                 continue :loop;
             };
+
             switch (packet) {
                 .publish => |*publish| {
                     try client.puback(.{}, .{ .packet_identifier = publish.packet_identifier.? });
