@@ -189,39 +189,6 @@ pub fn encodeConnect(buf: []u8, opts: mqtt.ConnectOpts) ![]u8 {
     return encodePacketHeader(buf[0..pos], 1, 0);
 }
 
-pub fn encodePublish(
-    buf: []u8,
-    packet_identifier: ?u16,
-    opts: mqtt.PublishOpts,
-) ![]u8 {
-    const publish_flags = PublishFlags{
-        .dup = opts.dup,
-        .qos = opts.qos,
-        .retain = opts.retain,
-    };
-
-    // reserve 1 byte for the packet type
-    // reserve 4 bytes for the packet length (which might be less than 4 bytes)
-    const VARIABLE_HEADER_OFFSET = 5;
-    const topic_len = try writeString(buf[VARIABLE_HEADER_OFFSET..], opts.topic);
-
-    var properties_offset = VARIABLE_HEADER_OFFSET + topic_len;
-    if (packet_identifier) |pi| {
-        const packet_identifier_offset = properties_offset;
-        properties_offset += 2;
-        writeInt(u16, buf[packet_identifier_offset..properties_offset][0..2], pi);
-    }
-
-    const payload_offset = properties_offset;
-    const message = opts.message;
-    const end = payload_offset + message.len;
-    if (end > buf.len) {
-        return error.WriteBufferIsFull;
-    }
-    @memcpy(buf[payload_offset..end], message);
-    return encodePacketHeader(buf[0..end], 3, @as(u4, @bitCast(publish_flags)));
-}
-
 pub fn encodeSubscribe(
     buf: []u8,
     packet_identifier: u16,
@@ -261,6 +228,39 @@ pub fn encodeUnsubscribe(
     return encodePacketHeader(buf[0..pos], 10, 2);
 }
 
+pub fn encodePublish(
+    buf: []u8,
+    packet_identifier: ?u16,
+    opts: mqtt.PublishOpts,
+) ![]u8 {
+    const publish_flags = PublishFlags{
+        .dup = opts.dup,
+        .qos = opts.qos,
+        .retain = opts.retain,
+    };
+
+    // reserve 1 byte for the packet type
+    // reserve 4 bytes for the packet length (which might be less than 4 bytes)
+    const VARIABLE_HEADER_OFFSET = 5;
+    const topic_len = try writeString(buf[VARIABLE_HEADER_OFFSET..], opts.topic);
+
+    var properties_offset = VARIABLE_HEADER_OFFSET + topic_len;
+    if (packet_identifier) |pi| {
+        const packet_identifier_offset = properties_offset;
+        properties_offset += 2;
+        writeInt(u16, buf[packet_identifier_offset..properties_offset][0..2], pi);
+    }
+
+    const payload_offset = properties_offset;
+    const message = opts.message;
+    const end = payload_offset + message.len;
+    if (end > buf.len) {
+        return error.WriteBufferIsFull;
+    }
+    @memcpy(buf[payload_offset..end], message);
+    return encodePacketHeader(buf[0..end], 3, @as(u4, @bitCast(publish_flags)));
+}
+
 pub fn encodePubAck(buf: []u8, opts: mqtt.PubAckOpts) ![]u8 {
     // reserve 1 byte for the packet type
     // reserve 4 bytes for the packet length (which might be less than 4 bytes)
@@ -268,6 +268,39 @@ pub fn encodePubAck(buf: []u8, opts: mqtt.PubAckOpts) ![]u8 {
 
     // MQTT 3.1.1: only packet identifier (2 bytes)
     buf[3] = 64; // packet type (0100) + flags (0000)
+    buf[4] = 2; // remaining length
+    return buf[3..7];
+}
+
+pub fn encodePubRec(buf: []u8, opts: mqtt.PubRecOpts) ![]u8 {
+    // reserve 1 byte for the packet type
+    // reserve 4 bytes for the packet length (which might be less than 4 bytes)
+    writeInt(u16, buf[5..7], opts.packet_identifier);
+
+    // MQTT 3.1.1: only packet identifier (2 bytes)
+    buf[3] = 80; // packet type (0101) + flags (0000)
+    buf[4] = 2; // remaining length
+    return buf[3..7];
+}
+
+pub fn encodePubRel(buf: []u8, opts: mqtt.PubRelOpts) ![]u8 {
+    // reserve 1 byte for the packet type
+    // reserve 4 bytes for the packet length (which might be less than 4 bytes)
+    writeInt(u16, buf[5..7], opts.packet_identifier);
+
+    // MQTT 3.1.1: only packet identifier (2 bytes)
+    buf[3] = 98; // packet type (0110) + flags (0010)
+    buf[4] = 2; // remaining length
+    return buf[3..7];
+}
+
+pub fn encodePubComp(buf: []u8, opts: mqtt.PubCompOpts) ![]u8 {
+    // reserve 1 byte for the packet type
+    // reserve 4 bytes for the packet length (which might be less than 4 bytes)
+    writeInt(u16, buf[5..7], opts.packet_identifier);
+
+    // MQTT 3.1.1: only packet identifier (2 bytes)
+    buf[3] = 112; // packet type (0111) + flags (0000)
     buf[4] = 2; // remaining length
     return buf[3..7];
 }

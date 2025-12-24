@@ -281,13 +281,6 @@ pub const Client = struct {
         };
     }
 
-    fn close(self: *Self) void {
-        if (self.socket) |socket| {
-            posix.close(socket);
-            self.socket = null;
-        }
-    }
-
     pub fn deinit(self: *Self) void {
         self.close();
 
@@ -300,11 +293,44 @@ pub const Client = struct {
         }
     }
 
-    pub fn publish(
-        self: *Self,
-        rw: ReadWriteOpts,
-        opts: PublishOpts,
-    ) !?u16 {
+    pub fn connect(self: *Self, rw: ReadWriteOpts, opts: ConnectOpts) !void {
+        const connect_packet = try codec.encodeConnect(self.write_buf, opts);
+        try self.write(&self.createContext(rw), connect_packet);
+    }
+
+    pub fn subscribe(self: *Self, rw: ReadWriteOpts, opts: SubscribeOpts) !u16 {
+        if (opts.topics.len == 0) {
+            self.last_error = .{ .details = "must have at least 1 topic" };
+            return error.Usage;
+        }
+
+        const packet_identifier = self.packetIdentifier(opts.packet_identifier);
+        const subscribe_packet = try codec.encodeSubscribe(
+            self.write_buf,
+            packet_identifier,
+            opts,
+        );
+        try self.write(&self.createContext(rw), subscribe_packet);
+        return packet_identifier;
+    }
+
+    pub fn unsubscribe(self: *Self, rw: ReadWriteOpts, opts: UnsubscribeOpts) !u16 {
+        if (opts.topics.len == 0) {
+            self.last_error = .{ .details = "must have at least 1 topic" };
+            return error.Usage;
+        }
+
+        const packet_identifier = self.packetIdentifier(opts.packet_identifier);
+        const unsubscribe_packet = try codec.encodeUnsubscribe(
+            self.write_buf,
+            packet_identifier,
+            opts,
+        );
+        try self.write(&self.createContext(rw), unsubscribe_packet);
+        return packet_identifier;
+    }
+
+    pub fn publish(self: *Self, rw: ReadWriteOpts, opts: PublishOpts) !?u16 {
         if (opts.retain == true and self.server_can_retain == false) {
             self.last_error = .{ .details = "server does not support retained messages" };
             return error.Usage;
@@ -320,69 +346,38 @@ pub const Client = struct {
             packet_identifier = self.packetIdentifier(opts.packet_identifier);
         }
 
-        const publish_packet = try codec.encodePublish(self.write_buf, packet_identifier, opts);
+        const publish_packet = try codec.encodePublish(
+            self.write_buf,
+            packet_identifier,
+            opts,
+        );
 
         try self.write(&self.createContext(rw), publish_packet);
         return packet_identifier;
     }
 
-    pub fn subscribe(
-        self: *Self,
-        rw: ReadWriteOpts,
-        opts: SubscribeOpts,
-    ) !u16 {
-        if (opts.topics.len == 0) {
-            self.last_error = .{ .details = "must have at least 1 topic" };
-            return error.Usage;
-        }
-
-        const packet_identifier = self.packetIdentifier(opts.packet_identifier);
-        const subscribe_packet = try codec.encodeSubscribe(self.write_buf, packet_identifier, opts);
-        try self.write(&self.createContext(rw), subscribe_packet);
-        return packet_identifier;
-    }
-
-    pub fn unsubscribe(
-        self: *Self,
-        rw: ReadWriteOpts,
-        opts: UnsubscribeOpts,
-    ) !u16 {
-        if (opts.topics.len == 0) {
-            self.last_error = .{ .details = "must have at least 1 topic" };
-            return error.Usage;
-        }
-
-        const packet_identifier = self.packetIdentifier(opts.packet_identifier);
-        const unsubscribe_packet = try codec.encodeUnsubscribe(self.write_buf, packet_identifier, opts);
-        try self.write(&self.createContext(rw), unsubscribe_packet);
-        return packet_identifier;
-    }
-
-    pub fn puback(
-        self: *Self,
-        rw: ReadWriteOpts,
-        opts: PubAckOpts,
-    ) !void {
+    pub fn puback(self: *Self, rw: ReadWriteOpts, opts: PubAckOpts) !void {
         const puback_packet = try codec.encodePubAck(self.write_buf, opts);
         try self.write(&self.createContext(rw), puback_packet);
     }
 
-    const Context = struct {
-        retries: u16 = 1,
-        timeout: i32 = 10_000,
-    };
-
-    fn createContext(self: *Self, rw: ReadWriteOpts) Context {
-        return .{
-            .retries = rw.retries orelse self.default_retries,
-            .timeout = rw.timeout orelse self.default_timeout,
-        };
+    pub fn pubrec(self: *Self, rw: ReadWriteOpts, opts: PubRecOpts) !void {
+        const pubrec_packet = try codec.encodePubRec(self.write_buf, opts);
+        try self.write(&self.createContext(rw), pubrec_packet);
     }
 
-    pub fn connect(self: *Self, rw: ReadWriteOpts, opts: ConnectOpts) !void {
-        const connect_packet = try codec.encodeConnect(self.write_buf, opts);
+    pub fn pubrel(self: *Self, rw: ReadWriteOpts, opts: PubRelOpts) !void {
+        const pubrel_packet = try codec.encodePubRel(self.write_buf, opts);
+        try self.write(&self.createContext(rw), pubrel_packet);
+    }
 
-        try self.write(&self.createContext(rw), connect_packet);
+    pub fn pubcomp(self: *Self, rw: ReadWriteOpts, opts: PubCompOpts) !void {
+        const pubcomp_packet = try codec.encodePubComp(self.write_buf, opts);
+        try self.write(&self.createContext(rw), pubcomp_packet);
+    }
+
+    pub fn ping(self: *Self, rw: ReadWriteOpts) !void {
+        try self.write(&self.createContext(rw), &.{ 192, 0 });
     }
 
     pub fn disconnect(self: *Self, rw: ReadWriteOpts) !void {
@@ -404,6 +399,26 @@ pub const Client = struct {
         return self.write(&self.createContext(rw), disconnect_packet);
     }
 
+    pub fn lastError(self: *const Self) ?ErrorDetail {
+        return self.last_error;
+    }
+
+    pub fn lastReadPacket(self: *const Self) []const u8 {
+        return self.read_buf[0..self.read_pos];
+    }
+
+    fn close(self: *Self) void {
+        if (self.socket) |socket| {
+            posix.close(socket);
+            self.socket = null;
+        }
+    }
+
+    const Context = struct {
+        retries: u16 = 1,
+        timeout: i32 = 10_000,
+    };
+
     fn packetIdentifier(self: *Self, explicit: ?u16) u16 {
         if (explicit) |pi| {
             return pi;
@@ -411,6 +426,13 @@ pub const Client = struct {
         const pi = self.packet_identifier +% 1;
         self.packet_identifier = pi;
         return pi;
+    }
+
+    fn createContext(self: *Self, rw: ReadWriteOpts) Context {
+        return .{
+            .retries = rw.retries orelse self.default_retries,
+            .timeout = rw.timeout orelse self.default_timeout,
+        };
     }
 
     fn getOrConnectSocket(self: *Self) !posix.socket_t {
@@ -562,7 +584,7 @@ pub const Client = struct {
         };
     }
 
-    pub fn read(self: *Self, ctx: *const Context, buf: []u8, _: usize) !?usize {
+    fn read(self: *Self, ctx: *const Context, buf: []u8, _: usize) !?usize {
         const absolute_timeout = std.time.milliTimestamp() + ctx.timeout;
 
         // on disconnect, the number of times that we'll try to reconnect and
@@ -621,7 +643,7 @@ pub const Client = struct {
         }
     }
 
-    pub fn write(self: *Self, ctx: *const Context, data: []const u8) !void {
+    fn write(self: *Self, ctx: *const Context, data: []const u8) !void {
         const absolute_timeout = std.time.milliTimestamp() + ctx.timeout;
 
         // on disconnect, the number of times that we'll try to reconnect and

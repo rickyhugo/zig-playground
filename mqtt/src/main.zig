@@ -14,7 +14,10 @@ pub fn main() !void {
         .host = "localhost",
         .allocator = allocator,
     });
-    defer client.deinit();
+    defer {
+        client.disconnect(.{ .timeout = 1000 }) catch {};
+        client.deinit();
+    }
 
     _ = try client.connect(
         .{ .timeout = 2000 },
