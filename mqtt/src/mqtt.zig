@@ -18,6 +18,7 @@ pub const ConnectOpts = struct {
     password: ?[]const u8 = null,
     will: ?Will = null,
     keepalive_sec: u16 = 0,
+    clean_session: bool = true,
 
     pub const Will = struct {
         topic: []const u8,
@@ -265,7 +266,7 @@ pub const Client = struct {
             .connect_timeout = opts.connect_timeout,
             .default_retries = opts.default_retries orelse 1,
             .default_timeout = opts.default_timeout orelse 5_000,
-            .packet_identifier = 0,
+            .packet_identifier = 1,
             .last_error = null,
         };
     }
@@ -444,18 +445,13 @@ pub const Client = struct {
 
         const packet = (try self.readOrBuffered(&ctx)) orelse return null;
         switch (packet) {
-            .connack => |*connack| try self.processConnack(&ctx, connack),
+            .connack => |*connack| try self.processConnack(connack),
             else => {},
         }
         return packet;
     }
 
-    fn processConnack(
-        self: *Self,
-        ctx: *Context,
-        connack: *const Packet.ConnAck,
-    ) !void {
-        // Check if connection was rejected
+    fn processConnack(self: *Self, connack: *const Packet.ConnAck) !void {
         if (connack.return_code != .accepted) {
             self.close();
 
@@ -471,18 +467,6 @@ pub const Client = struct {
             };
 
             return error.ConnectionRefused;
-        }
-
-        // In MQTT 3.1.1, we always request clean_session=true, so session_present
-        // should always be false. If it's true, that's a protocol error.
-        if (connack.session_present) {
-            self.disconnect(.{ .retries = ctx.retries, .timeout = ctx.timeout }) catch {};
-
-            self.last_error = .{
-                .details = "connack indicated the presence of a session despite requesting clean_session",
-            };
-
-            return error.Protocol;
         }
     }
 

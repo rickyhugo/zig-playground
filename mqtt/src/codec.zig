@@ -138,13 +138,14 @@ pub fn encodePacketHeader(buf: []u8, packet_type: u8, packet_flags: u8) ![]u8 {
 pub fn encodeConnect(buf: []u8, opts: mqtt.ConnectOpts) ![]u8 {
     var connect_flags = packed struct(u8) {
         _reserved: bool = false,
-        clean_start: bool = true,
+        clean_session: bool,
         will: bool = false,
         will_qos: mqtt.QoS = .at_most_once,
         will_retain: bool = false,
         username: bool,
         password: bool,
     }{
+        .clean_session = opts.clean_session,
         .username = opts.username != null,
         .password = opts.password != null,
     };
