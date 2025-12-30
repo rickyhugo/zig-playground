@@ -194,7 +194,7 @@ fn decodePublish(data: []u8, flags: u4) !Packet.Publish {
         return error.IncompletePacket;
     }
 
-    const publish_flags: *codec.PublishFlags = @ptrCast(@constCast(&flags));
+    const publish_flags: codec.PublishFlags = @bitCast(flags);
 
     const topic, var message_offset = try codec.readString(data);
     var publish = Packet.Publish{

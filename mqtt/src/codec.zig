@@ -1,3 +1,4 @@
+const std = @import("std");
 const builtin = @import("builtin");
 
 const mqtt = @import("mqtt.zig");
@@ -111,6 +112,9 @@ pub fn calcLengthOfVarint(len: usize) usize {
     };
 }
 
+// Maximum length of MQTT fixed header: 1 byte packet type + 4 bytes max varint length
+const MAX_FIXED_HEADER_LEN = 5;
+
 pub const PublishFlags = packed struct(u4) {
     dup: bool,
     qos: mqtt.QoS,
@@ -118,13 +122,13 @@ pub const PublishFlags = packed struct(u4) {
 };
 
 pub fn encodePacketHeader(buf: []u8, packet_type: u8, packet_flags: u8) ![]u8 {
-    const remaining_len = buf.len - 5;
+    const remaining_len = buf.len - MAX_FIXED_HEADER_LEN;
     const length_of_len = calcLengthOfVarint(remaining_len);
 
     // This is where, in buf, our packet is actually going to start. You'd think
     // it would start at buf[0], but the package length is variable, so it'll
     // only start at buf[0] in the [unlikely] case where the length took 4 bytes.
-    const start = 5 - length_of_len - 1;
+    const start = MAX_FIXED_HEADER_LEN - length_of_len - 1;
 
     buf[start] = (packet_type << 4) | packet_flags;
     _ = try writeVarint(buf[start + 1 ..], remaining_len);
@@ -151,19 +155,19 @@ pub fn encodeConnect(buf: []u8, opts: mqtt.ConnectOpts) ![]u8 {
         connect_flags.will_retain = w.retain;
     }
 
-    buf[5] = 0;
-    buf[6] = 4;
-    buf[7] = 'M';
-    buf[8] = 'Q';
-    buf[9] = 'T';
-    buf[10] = 'T';
-    buf[11] = 4;
+    buf[MAX_FIXED_HEADER_LEN] = 0;
+    buf[MAX_FIXED_HEADER_LEN + 1] = 4;
+    buf[MAX_FIXED_HEADER_LEN + 2] = 'M';
+    buf[MAX_FIXED_HEADER_LEN + 3] = 'Q';
+    buf[MAX_FIXED_HEADER_LEN + 4] = 'T';
+    buf[MAX_FIXED_HEADER_LEN + 5] = 'T';
+    buf[MAX_FIXED_HEADER_LEN + 6] = 4;
 
-    buf[12] = @bitCast(connect_flags);
+    buf[MAX_FIXED_HEADER_LEN + 7] = @bitCast(connect_flags);
 
-    writeInt(u16, buf[13..15], opts.keepalive_sec);
+    writeInt(u16, buf[MAX_FIXED_HEADER_LEN + 8 ..][0..2], opts.keepalive_sec);
 
-    const PAYLOAD_OFFSET = 15;
+    const PAYLOAD_OFFSET = MAX_FIXED_HEADER_LEN + 10;
 
     var pos: usize = PAYLOAD_OFFSET;
     pos += try writeString(buf[pos..], opts.client_id orelse "");
@@ -189,11 +193,10 @@ pub fn encodeSubscribe(
     packet_identifier: u16,
     opts: mqtt.SubscribeOpts,
 ) ![]u8 {
-    // reserve 1 byte for the packet type
-    // reserve 4 bytes for the packet length (which might be less than 4 bytes)
-    writeInt(u16, buf[5..7], packet_identifier);
+    // reserve MAX_FIXED_HEADER_LEN bytes for the fixed header
+    writeInt(u16, buf[MAX_FIXED_HEADER_LEN..][0..2], packet_identifier);
 
-    const PAYLOAD_OFFSET = 7;
+    const PAYLOAD_OFFSET = MAX_FIXED_HEADER_LEN + 2;
     var pos: usize = PAYLOAD_OFFSET;
     for (opts.topics) |topic| {
         pos += try writeString(buf[pos..], topic.filter);
@@ -209,11 +212,10 @@ pub fn encodeUnsubscribe(
     packet_identifier: u16,
     opts: mqtt.UnsubscribeOpts,
 ) ![]u8 {
-    // reserve 1 byte for the packet type
-    // reserve 4 bytes for the packet length (which might be less than 4 bytes)
-    writeInt(u16, buf[5..7], packet_identifier);
+    // reserve MAX_FIXED_HEADER_LEN bytes for the fixed header
+    writeInt(u16, buf[MAX_FIXED_HEADER_LEN..][0..2], packet_identifier);
 
-    const PAYLOAD_OFFSET = 7;
+    const PAYLOAD_OFFSET = MAX_FIXED_HEADER_LEN + 2;
     var pos = PAYLOAD_OFFSET;
     for (opts.topics) |topic| {
         pos += try writeString(buf[pos..], topic);
@@ -227,22 +229,25 @@ pub fn encodePublish(
     packet_identifier: ?u16,
     opts: mqtt.PublishOpts,
 ) ![]u8 {
+    // Validate topic per MQTT 3.1.1 spec
+    if (opts.topic.len == 0) return error.EmptyTopic;
+    if (opts.topic.len > 65535) return error.TopicTooLong;
+    // PUBLISH topics must not contain wildcards
+    if (std.mem.indexOfAny(u8, opts.topic, "#+")) |_| return error.InvalidTopicCharacter;
+
     const publish_flags = PublishFlags{
         .dup = opts.dup,
         .qos = opts.qos,
         .retain = opts.retain,
     };
 
-    // reserve 1 byte for the packet type
-    // reserve 4 bytes for the packet length (which might be less than 4 bytes)
-    const VARIABLE_HEADER_OFFSET = 5;
-    const topic_len = try writeString(buf[VARIABLE_HEADER_OFFSET..], opts.topic);
+    // reserve MAX_FIXED_HEADER_LEN bytes for the fixed header
+    const topic_len = try writeString(buf[MAX_FIXED_HEADER_LEN..], opts.topic);
 
-    var payload_offset = VARIABLE_HEADER_OFFSET + topic_len;
+    var payload_offset = MAX_FIXED_HEADER_LEN + topic_len;
     if (packet_identifier) |pi| {
-        const packet_identifier_offset = payload_offset;
+        writeInt(u16, buf[payload_offset..][0..2], pi);
         payload_offset += 2;
-        writeInt(u16, buf[packet_identifier_offset..payload_offset][0..2], pi);
     }
 
     const message = opts.message;
@@ -256,50 +261,34 @@ pub fn encodePublish(
 }
 
 pub fn encodePubAck(buf: []u8, opts: mqtt.PubAckOpts) ![]u8 {
-    // reserve 1 byte for the packet type
-    // reserve 4 bytes for the packet length (which might be less than 4 bytes)
-    writeInt(u16, buf[5..7], opts.packet_identifier);
-
+    // reserve MAX_FIXED_HEADER_LEN bytes for the fixed header
     // MQTT 3.1.1: only packet identifier (2 bytes)
-    buf[3] = 64; // packet type (0100) + flags (0000)
-    buf[4] = 2; // remaining length
-    return buf[3..7];
+    writeInt(u16, buf[MAX_FIXED_HEADER_LEN..][0..2], opts.packet_identifier);
+    return encodePacketHeader(buf[0 .. MAX_FIXED_HEADER_LEN + 2], 4, 0);
 }
 
 pub fn encodePubRec(buf: []u8, opts: mqtt.PubRecOpts) ![]u8 {
-    // reserve 1 byte for the packet type
-    // reserve 4 bytes for the packet length (which might be less than 4 bytes)
-    writeInt(u16, buf[5..7], opts.packet_identifier);
-
+    // reserve MAX_FIXED_HEADER_LEN bytes for the fixed header
     // MQTT 3.1.1: only packet identifier (2 bytes)
-    buf[3] = 80; // packet type (0101) + flags (0000)
-    buf[4] = 2; // remaining length
-    return buf[3..7];
+    writeInt(u16, buf[MAX_FIXED_HEADER_LEN..][0..2], opts.packet_identifier);
+    return encodePacketHeader(buf[0 .. MAX_FIXED_HEADER_LEN + 2], 5, 0);
 }
 
 pub fn encodePubRel(buf: []u8, opts: mqtt.PubRelOpts) ![]u8 {
-    // reserve 1 byte for the packet type
-    // reserve 4 bytes for the packet length (which might be less than 4 bytes)
-    writeInt(u16, buf[5..7], opts.packet_identifier);
-
-    // MQTT 3.1.1: only packet identifier (2 bytes)
-    buf[3] = 98; // packet type (0110) + flags (0010)
-    buf[4] = 2; // remaining length
-    return buf[3..7];
+    // reserve MAX_FIXED_HEADER_LEN bytes for the fixed header
+    // MQTT 3.1.1: only packet identifier (2 bytes), flags must be 0010
+    writeInt(u16, buf[MAX_FIXED_HEADER_LEN..][0..2], opts.packet_identifier);
+    return encodePacketHeader(buf[0 .. MAX_FIXED_HEADER_LEN + 2], 6, 2);
 }
 
 pub fn encodePubComp(buf: []u8, opts: mqtt.PubCompOpts) ![]u8 {
-    // reserve 1 byte for the packet type
-    // reserve 4 bytes for the packet length (which might be less than 4 bytes)
-    writeInt(u16, buf[5..7], opts.packet_identifier);
-
+    // reserve MAX_FIXED_HEADER_LEN bytes for the fixed header
     // MQTT 3.1.1: only packet identifier (2 bytes)
-    buf[3] = 112; // packet type (0111) + flags (0000)
-    buf[4] = 2; // remaining length
-    return buf[3..7];
+    writeInt(u16, buf[MAX_FIXED_HEADER_LEN..][0..2], opts.packet_identifier);
+    return encodePacketHeader(buf[0 .. MAX_FIXED_HEADER_LEN + 2], 7, 0);
 }
 
 pub fn encodeDisconnect(buf: []u8) ![]u8 {
     // In MQTT 3.1.1, DISCONNECT has no variable header (only fixed header)
-    return encodePacketHeader(buf[0..5], 14, 0);
+    return encodePacketHeader(buf[0..MAX_FIXED_HEADER_LEN], 14, 0);
 }

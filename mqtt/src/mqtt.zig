@@ -442,12 +442,12 @@ pub const Client = struct {
     pub fn readPacket(self: *Self, rw: ReadWriteOpts) !?Packet {
         var ctx = self.createContext(rw);
 
-        const p = (try self.readOrBuffered(&ctx)) orelse return null;
-        switch (p) {
+        const packet = (try self.readOrBuffered(&ctx)) orelse return null;
+        switch (packet) {
             .connack => |*connack| try self.processConnack(&ctx, connack),
             else => {},
         }
-        return p;
+        return packet;
     }
 
     fn processConnack(
