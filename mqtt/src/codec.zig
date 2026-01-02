@@ -217,7 +217,7 @@ pub fn encodeUnsubscribe(
     writeInt(u16, buf[MAX_FIXED_HEADER_LEN..][0..2], packet_identifier);
 
     const PAYLOAD_OFFSET = MAX_FIXED_HEADER_LEN + 2;
-    var pos = PAYLOAD_OFFSET;
+    var pos: usize = PAYLOAD_OFFSET;
     for (opts.topics) |topic| {
         pos += try writeString(buf[pos..], topic);
     }

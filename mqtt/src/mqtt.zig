@@ -198,6 +198,17 @@ pub const Client = struct {
 
     last_error: ?ErrorDetail,
 
+    // Timestamps for connection health tracking (milliseconds)
+    last_recv_time: i64 = 0,
+    last_send_time: i64 = 0,
+    ping_sent_time: ?i64 = null,
+
+    pub const HealthStatus = enum {
+        ok,
+        stale, // No recent activity, should send PINGREQ
+        unresponsive, // PINGREQ sent but no response within threshold
+    };
+
     pub const Opts = struct {
         port: u16 = 0,
 
@@ -268,6 +279,9 @@ pub const Client = struct {
             .default_timeout = opts.default_timeout orelse 5_000,
             .packet_identifier = 1,
             .last_error = null,
+            .last_recv_time = 0,
+            .last_send_time = 0,
+            .ping_sent_time = null,
         };
     }
 
@@ -358,7 +372,8 @@ pub const Client = struct {
     }
 
     pub fn pingreq(self: *Self, rw: ReadWriteOpts) !void {
-        try self.write(&self.createContext(rw), &.{ 192, 0 });
+        try self.write(&self.createContext(rw), &.{ 0xC0, 0x00 });
+        self.ping_sent_time = std.time.milliTimestamp();
     }
 
     pub fn disconnect(self: *Self, rw: ReadWriteOpts) !void {
@@ -386,6 +401,29 @@ pub const Client = struct {
 
     pub fn lastReadPacket(self: *const Self) []const u8 {
         return self.read_buf[0..self.read_pos];
+    }
+
+    /// Check connection health based on activity timestamps.
+    /// `threshold_ms` is how long without activity before connection is considered stale.
+    pub fn checkHealth(self: *const Self, threshold_ms: i64) HealthStatus {
+        const now = std.time.milliTimestamp();
+
+        // If we sent a ping and haven't received anything since, check if it's overdue
+        if (self.ping_sent_time) |ping_time| {
+            if (now - ping_time > threshold_ms) {
+                return .unresponsive;
+            }
+            // Ping sent, still waiting (within threshold)
+            return .ok;
+        }
+
+        // No pending ping - check if we need to send one
+        const last_activity = @max(self.last_recv_time, self.last_send_time);
+        if (last_activity > 0 and now - last_activity > threshold_ms) {
+            return .stale;
+        }
+
+        return .ok;
     }
 
     fn close(self: *Self) void {
@@ -549,6 +587,9 @@ pub const Client = struct {
         }
 
         self.read_pos += total_len;
+        self.last_recv_time = std.time.milliTimestamp();
+        self.ping_sent_time = null; // Any response clears pending ping
+
         return Packet.decode(buf[0], buf[fixed_header_len..total_len]) catch |err| {
             self.last_error = .{ .inner = err };
             switch (err) {
@@ -672,6 +713,8 @@ pub const Client = struct {
                 },
             };
         }
+
+        self.last_send_time = std.time.milliTimestamp();
     }
 
     /// Inject data into the read buffer for testing purposes.
@@ -737,13 +780,11 @@ test "Client.init requires allocator when no buffers provided" {
 }
 
 test "Client.init requires host or ip" {
-    var read_buf: [64]u8 = undefined;
-    var write_buf: [64]u8 = undefined;
-
+    // When neither host nor ip is provided, Address.init returns HostOrIPRequired
+    // We need an allocator because ip is null (DNS resolution might be needed)
     try std.testing.expectError(error.HostOrIPRequired, Client.init(.{
         .port = 1883,
-        .read_buf = &read_buf,
-        .write_buf = &write_buf,
+        .allocator = std.testing.allocator,
     }));
 }
 
@@ -1213,4 +1254,137 @@ test "Client.unsubscribe validation" {
     const result = client.unsubscribe(.{}, .{ .topics = &topics });
     try std.testing.expectError(error.Usage, result);
     try std.testing.expectEqualStrings("must have at least 1 topic", client.lastError().?.details);
+}
+
+test "Client.checkHealth ok when no activity yet" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // No activity timestamps set yet - should be ok
+    try std.testing.expectEqual(Client.HealthStatus.ok, client.checkHealth(5000));
+}
+
+test "Client.checkHealth stale after threshold" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // Simulate activity in the past
+    const now = std.time.milliTimestamp();
+    client.last_recv_time = now - 10_000; // 10 seconds ago
+
+    // With 5s threshold, should be stale
+    try std.testing.expectEqual(Client.HealthStatus.stale, client.checkHealth(5000));
+
+    // With 15s threshold, should be ok
+    try std.testing.expectEqual(Client.HealthStatus.ok, client.checkHealth(15_000));
+}
+
+test "Client.checkHealth ok when ping pending within threshold" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // Simulate ping sent recently
+    const now = std.time.milliTimestamp();
+    client.ping_sent_time = now - 1000; // 1 second ago
+
+    // With 5s threshold, should still be ok (waiting for response)
+    try std.testing.expectEqual(Client.HealthStatus.ok, client.checkHealth(5000));
+}
+
+test "Client.checkHealth unresponsive when ping times out" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // Simulate ping sent long ago with no response
+    const now = std.time.milliTimestamp();
+    client.ping_sent_time = now - 10_000; // 10 seconds ago
+
+    // With 5s threshold, ping timed out - unresponsive
+    try std.testing.expectEqual(Client.HealthStatus.unresponsive, client.checkHealth(5000));
+}
+
+test "Client.checkHealth clears ping on receive" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // Simulate pending ping
+    client.ping_sent_time = std.time.milliTimestamp() - 1000;
+
+    // Receive a packet (PINGRESP)
+    try client.injectReadData(&[_]u8{ 0xD0, 0x00 });
+    _ = try client.getBufferedPacket();
+
+    // ping_sent_time should be cleared
+    try std.testing.expectEqual(@as(?i64, null), client.ping_sent_time);
+    try std.testing.expect(client.last_recv_time > 0);
+}
+
+test "Client.checkHealth uses max of send and recv time" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    const now = std.time.milliTimestamp();
+
+    // Old recv, recent send - should be ok
+    client.last_recv_time = now - 10_000;
+    client.last_send_time = now - 1000;
+    try std.testing.expectEqual(Client.HealthStatus.ok, client.checkHealth(5000));
+
+    // Recent recv, old send - should be ok
+    client.last_recv_time = now - 1000;
+    client.last_send_time = now - 10_000;
+    try std.testing.expectEqual(Client.HealthStatus.ok, client.checkHealth(5000));
+
+    // Both old - should be stale
+    client.last_recv_time = now - 10_000;
+    client.last_send_time = now - 10_000;
+    try std.testing.expectEqual(Client.HealthStatus.stale, client.checkHealth(5000));
 }
