@@ -178,12 +178,12 @@ pub fn encodeConnect(buf: []u8, opts: mqtt.ConnectOpts) ![]u8 {
         pos += try writeString(buf[pos..], will.message);
     }
 
-    if (opts.username) |u| {
-        pos += try writeString(buf[pos..], u);
+    if (opts.username) |username| {
+        pos += try writeString(buf[pos..], username);
     }
 
-    if (opts.password) |p| {
-        pos += try writeString(buf[pos..], p);
+    if (opts.password) |password| {
+        pos += try writeString(buf[pos..], password);
     }
 
     return encodePacketHeader(buf[0..pos], 1, 0);

@@ -401,12 +401,11 @@ pub const Client = struct {
     };
 
     fn packetIdentifier(self: *Self, explicit: ?u16) u16 {
-        if (explicit) |pi| {
-            return pi;
+        if (explicit) |packet_identifier| {
+            return packet_identifier;
         }
-        const pi = self.packet_identifier +% 1;
-        self.packet_identifier = pi;
-        return pi;
+        defer self.packet_identifier +%= 1;
+        return self.packet_identifier;
     }
 
     fn createContext(self: *Self, rw: ReadWriteOpts) Context {
@@ -499,12 +498,9 @@ pub const Client = struct {
 
                 // ... and we didn't start reading this message from the start of our
                 // buffer, so if we move things around, we'll have new free space.
-
-                // std.mem.copyForward. can't use @memcpy because these potentially overlap
                 pos = self.read_len - read_pos;
-                for (buf[0..pos], buf[read_pos..]) |*d, s| {
-                    d.* = s;
-                }
+                @memmove(buf[0..pos], buf[read_pos..][0..pos]);
+
                 self.read_pos = 0;
                 self.read_len = pos;
             }
@@ -518,8 +514,8 @@ pub const Client = struct {
             self.read_len += n;
 
             // bufferedPacket() will set read_pos
-            if (try self.bufferedPacket()) |p| {
-                return p;
+            if (try self.bufferedPacket()) |packet| {
+                return packet;
             }
         }
     }
