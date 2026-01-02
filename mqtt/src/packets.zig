@@ -11,7 +11,7 @@ pub const Packet = union(enum) {
     pubrel: PubRel,
     pubcomp: PubComp,
     disconnect: Disconnect,
-    pong: void,
+    pingresp: void,
 
     pub const ConnAck = struct {
         session_present: bool,
@@ -105,7 +105,7 @@ pub const Packet = union(enum) {
             7 => return .{ .pubcomp = try decodePubComp(data, flags) },
             9 => return .{ .suback = try decodeSubAck(data, flags) },
             11 => return .{ .unsuback = try decodeUnsubAck(data, flags) },
-            13 => return if (flags == 0) .{ .pong = {} } else error.InvalidFlags,
+            13 => return if (flags == 0) .{ .pingresp = {} } else error.InvalidFlags,
             14 => return .{ .disconnect = try decodeDisconnect(data, flags) },
             else => return error.UnknownPacketType,
         }
@@ -290,4 +290,270 @@ fn decodeDisconnect(_: []u8, flags: u4) !Packet.Disconnect {
 
     // MQTT 3.1.1: DISCONNECT has no variable header or payload
     return .{};
+}
+
+const std = @import("std");
+
+test "Packet.decode dispatches correctly" {
+    // CONNACK: type 2, flags 0
+    var connack_data = [_]u8{ 0x00, 0x00 };
+    const connack = try Packet.decode(0x20, &connack_data);
+    try std.testing.expect(connack == .connack);
+
+    // PINGRESP: type 13, flags 0
+    const pingresp = try Packet.decode(0xD0, &[_]u8{});
+    try std.testing.expect(pingresp == .pingresp);
+
+    // DISCONNECT: type 14, flags 0
+    const disconnect = try Packet.decode(0xE0, &[_]u8{});
+    try std.testing.expect(disconnect == .disconnect);
+}
+
+test "Packet.decode unknown type" {
+    // Type 0 is reserved
+    try std.testing.expectError(error.UnknownPacketType, Packet.decode(0x00, &[_]u8{}));
+
+    // Type 15 is reserved
+    try std.testing.expectError(error.UnknownPacketType, Packet.decode(0xF0, &[_]u8{}));
+}
+
+test "decodeConnAck success" {
+    // Session present = 0, return code = 0 (accepted)
+    var data = [_]u8{ 0x00, 0x00 };
+    const packet = try Packet.decode(0x20, &data);
+    const connack = packet.connack;
+
+    try std.testing.expectEqual(false, connack.session_present);
+    try std.testing.expectEqual(Packet.ConnAck.ReturnCode.accepted, connack.return_code);
+}
+
+test "decodeConnAck session present" {
+    var data = [_]u8{ 0x01, 0x00 };
+    const packet = try Packet.decode(0x20, &data);
+
+    try std.testing.expectEqual(true, packet.connack.session_present);
+}
+
+test "decodeConnAck return codes" {
+    const test_cases = [_]struct { code: u8, expected: Packet.ConnAck.ReturnCode }{
+        .{ .code = 0, .expected = .accepted },
+        .{ .code = 1, .expected = .unacceptable_protocol_version },
+        .{ .code = 2, .expected = .identifier_rejected },
+        .{ .code = 3, .expected = .server_unavailable },
+        .{ .code = 4, .expected = .bad_username_or_password },
+        .{ .code = 5, .expected = .not_authorized },
+    };
+
+    for (test_cases) |tc| {
+        var data = [_]u8{ 0x00, tc.code };
+        const packet = try Packet.decode(0x20, &data);
+        try std.testing.expectEqual(tc.expected, packet.connack.return_code);
+    }
+}
+
+test "decodeConnAck invalid return code" {
+    var data = [_]u8{ 0x00, 0x06 }; // 6 is not valid in MQTT 3.1.1
+    try std.testing.expectError(error.InvalidReasonCode, Packet.decode(0x20, &data));
+}
+
+test "decodeConnAck invalid flags" {
+    var data = [_]u8{ 0x00, 0x00 };
+    // Flags should be 0, testing with flags = 1
+    try std.testing.expectError(error.InvalidFlags, Packet.decode(0x21, &data));
+}
+
+test "decodeConnAck malformed (reserved bits set)" {
+    // Bits 1-7 of byte 0 must be 0
+    var data = [_]u8{ 0x02, 0x00 };
+    try std.testing.expectError(error.MalformedPacket, Packet.decode(0x20, &data));
+}
+
+test "decodeConnAck incomplete" {
+    var data = [_]u8{0x00};
+    try std.testing.expectError(error.IncompletePacket, Packet.decode(0x20, &data));
+}
+
+test "decodePublish QoS 0" {
+    // Topic: "t" (length 1), no packet identifier, message: "m"
+    var data = [_]u8{ 0x00, 0x01, 't', 'm' };
+    const packet = try Packet.decode(0x30, &data); // flags: dup=0, qos=0, retain=0
+    const publish = packet.publish;
+
+    try std.testing.expectEqual(false, publish.dup);
+    try std.testing.expectEqual(mqtt.QoS.at_most_once, publish.qos);
+    try std.testing.expectEqual(false, publish.retain);
+    try std.testing.expectEqualStrings("t", publish.topic);
+    try std.testing.expectEqualStrings("m", publish.message);
+    try std.testing.expectEqual(@as(?u16, null), publish.packet_identifier);
+}
+
+test "decodePublish QoS 1" {
+    // Topic: "ab" (length 2), packet identifier: 0x0064 (100), message: "xyz"
+    var data = [_]u8{ 0x00, 0x02, 'a', 'b', 0x00, 0x64, 'x', 'y', 'z' };
+    const packet = try Packet.decode(0x32, &data); // flags: qos=1
+    const publish = packet.publish;
+
+    try std.testing.expectEqual(mqtt.QoS.at_least_once, publish.qos);
+    try std.testing.expectEqualStrings("ab", publish.topic);
+    try std.testing.expectEqual(@as(?u16, 100), publish.packet_identifier);
+    try std.testing.expectEqualStrings("xyz", publish.message);
+}
+
+test "decodePublish with flags" {
+    // Topic: "t", message: empty
+    var data = [_]u8{ 0x00, 0x01, 't', 0x00, 0x01 };
+    // flags: dup=1, qos=1, retain=1 -> 1011 = 0x0B
+    const packet = try Packet.decode(0x3B, &data);
+    const publish = packet.publish;
+
+    try std.testing.expectEqual(true, publish.dup);
+    try std.testing.expectEqual(mqtt.QoS.at_least_once, publish.qos);
+    try std.testing.expectEqual(true, publish.retain);
+    try std.testing.expectEqual(@as(?u16, 1), publish.packet_identifier);
+}
+
+test "decodePublish empty message" {
+    var data = [_]u8{ 0x00, 0x01, 't' };
+    const packet = try Packet.decode(0x30, &data);
+
+    try std.testing.expectEqualStrings("t", packet.publish.topic);
+    try std.testing.expectEqualStrings("", packet.publish.message);
+}
+
+test "decodePublish incomplete" {
+    // Too short for topic length
+    var data1 = [_]u8{0x00};
+    try std.testing.expectError(error.IncompletePacket, Packet.decode(0x30, &data1));
+
+    // QoS 1 without packet identifier
+    var data2 = [_]u8{ 0x00, 0x01, 't' };
+    try std.testing.expectError(error.IncompletePacket, Packet.decode(0x32, &data2));
+}
+
+test "decodePubAck" {
+    var data = [_]u8{ 0x12, 0x34 };
+    const packet = try Packet.decode(0x40, &data);
+
+    try std.testing.expectEqual(@as(u16, 0x1234), packet.puback.packet_identifier);
+}
+
+test "decodePubAck invalid flags" {
+    var data = [_]u8{ 0x00, 0x01 };
+    try std.testing.expectError(error.InvalidFlags, Packet.decode(0x41, &data));
+}
+
+test "decodePubAck incomplete" {
+    var data = [_]u8{0x00};
+    try std.testing.expectError(error.IncompletePacket, Packet.decode(0x40, &data));
+}
+
+test "decodePubRec" {
+    var data = [_]u8{ 0xAB, 0xCD };
+    const packet = try Packet.decode(0x50, &data);
+
+    try std.testing.expectEqual(@as(u16, 0xABCD), packet.pubrec.packet_identifier);
+}
+
+test "decodePubRel" {
+    var data = [_]u8{ 0x00, 0x2A }; // packet id = 42
+    // PUBREL flags must be 0x02
+    const packet = try Packet.decode(0x62, &data);
+
+    try std.testing.expectEqual(@as(u16, 42), packet.pubrel.packet_identifier);
+}
+
+test "decodePubRel invalid flags" {
+    var data = [_]u8{ 0x00, 0x01 };
+    // PUBREL with flags 0 instead of required 2
+    try std.testing.expectError(error.InvalidFlags, Packet.decode(0x60, &data));
+}
+
+test "decodePubComp" {
+    var data = [_]u8{ 0x03, 0xE7 }; // packet id = 999
+    const packet = try Packet.decode(0x70, &data);
+
+    try std.testing.expectEqual(@as(u16, 999), packet.pubcomp.packet_identifier);
+}
+
+test "decodeSubAck" {
+    // Packet identifier: 0x0001, results: [0x00, 0x01] (QoS 0, QoS 1)
+    var data = [_]u8{ 0x00, 0x01, 0x00, 0x01 };
+    const packet = try Packet.decode(0x90, &data);
+    const suback = packet.suback;
+
+    try std.testing.expectEqual(@as(u16, 1), suback.packet_identifier);
+    try std.testing.expectEqual(@as(usize, 2), suback.results.len);
+
+    // Test the result() helper
+    try std.testing.expectEqual(mqtt.QoS.at_most_once, try suback.result(0));
+    try std.testing.expectEqual(mqtt.QoS.at_least_once, try suback.result(1));
+}
+
+test "decodeSubAck failure result" {
+    // Packet identifier: 0x0005, results: [0x80] (failure)
+    var data = [_]u8{ 0x00, 0x05, 0x80 };
+    const packet = try Packet.decode(0x90, &data);
+    const suback = packet.suback;
+
+    try std.testing.expectError(error.Failure, suback.result(0));
+}
+
+test "decodeSubAck invalid result code" {
+    var data = [_]u8{ 0x00, 0x01, 0x03 }; // 0x03 is not valid (only 0,1,2,128)
+    const packet = try Packet.decode(0x90, &data);
+
+    try std.testing.expectError(error.Protocol, packet.suback.result(0));
+}
+
+test "decodeSubAck out of bounds" {
+    var data = [_]u8{ 0x00, 0x01, 0x00 };
+    const packet = try Packet.decode(0x90, &data);
+
+    try std.testing.expectError(error.OutOfBounds, packet.suback.result(1));
+}
+
+test "decodeSubAck invalid flags" {
+    var data = [_]u8{ 0x00, 0x01, 0x00 };
+    try std.testing.expectError(error.InvalidFlags, Packet.decode(0x91, &data));
+}
+
+test "decodeSubAck incomplete" {
+    // Need at least 3 bytes (2 for packet id, 1 for result)
+    var data = [_]u8{ 0x00, 0x01 };
+    try std.testing.expectError(error.IncompletePacket, Packet.decode(0x90, &data));
+}
+
+test "decodeUnsubAck" {
+    var data = [_]u8{ 0x00, 0x37 }; // packet id = 55
+    const packet = try Packet.decode(0xB0, &data);
+
+    try std.testing.expectEqual(@as(u16, 55), packet.unsuback.packet_identifier);
+}
+
+test "decodeUnsubAck invalid flags" {
+    var data = [_]u8{ 0x00, 0x01 };
+    try std.testing.expectError(error.InvalidFlags, Packet.decode(0xB1, &data));
+}
+
+test "decodeUnsubAck incomplete" {
+    var data = [_]u8{0x00};
+    try std.testing.expectError(error.IncompletePacket, Packet.decode(0xB0, &data));
+}
+
+test "decodePingResp" {
+    const packet = try Packet.decode(0xD0, &[_]u8{});
+    try std.testing.expect(packet == .pingresp);
+}
+
+test "decodePingResp invalid flags" {
+    try std.testing.expectError(error.InvalidFlags, Packet.decode(0xD1, &[_]u8{}));
+}
+
+test "decodeDisconnect" {
+    const packet = try Packet.decode(0xE0, &[_]u8{});
+    try std.testing.expect(packet == .disconnect);
+}
+
+test "decodeDisconnect invalid flags" {
+    try std.testing.expectError(error.InvalidFlags, Packet.decode(0xE1, &[_]u8{}));
 }

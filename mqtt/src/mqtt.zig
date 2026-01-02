@@ -199,7 +199,7 @@ pub const Client = struct {
     last_error: ?ErrorDetail,
 
     pub const Opts = struct {
-        port: u16,
+        port: u16 = 0,
 
         // either ip or host must be provided
         ip: ?[]const u8 = null,
@@ -221,7 +221,7 @@ pub const Client = struct {
         write_buf_size: u16 = 8192,
     };
 
-    const ReadWriteOpts = struct {
+    pub const ReadWriteOpts = struct {
         retries: ?u16 = null,
         timeout: ?i32 = null,
     };
@@ -357,7 +357,7 @@ pub const Client = struct {
         try self.write(&self.createContext(rw), pubcomp_packet);
     }
 
-    pub fn ping(self: *Self, rw: ReadWriteOpts) !void {
+    pub fn pingreq(self: *Self, rw: ReadWriteOpts) !void {
         try self.write(&self.createContext(rw), &.{ 192, 0 });
     }
 
@@ -673,4 +673,544 @@ pub const Client = struct {
             };
         }
     }
+
+    /// Inject data into the read buffer for testing purposes.
+    /// This simulates receiving data from the network.
+    pub fn injectReadData(self: *Self, data: []const u8) !void {
+        if (data.len > self.read_buf.len - self.read_len) {
+            return error.ReadBufferIsFull;
+        }
+        @memcpy(self.read_buf[self.read_len..][0..data.len], data);
+        self.read_len += data.len;
+    }
+
+    /// Get a buffered packet if one is complete, without doing network I/O.
+    /// Useful for testing the packet parsing logic.
+    pub fn getBufferedPacket(self: *Self) !?Packet {
+        return self.bufferedPacket();
+    }
 };
+
+test "Client.init with provided buffers" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    try std.testing.expectEqual(@as(?posix.socket_t, null), client.socket);
+    try std.testing.expectEqual(@as(usize, 0), client.read_pos);
+    try std.testing.expectEqual(@as(usize, 0), client.read_len);
+    try std.testing.expectEqual(@as(u16, 1), client.packet_identifier);
+    try std.testing.expectEqual(false, client.read_buf_own);
+    try std.testing.expectEqual(false, client.write_buf_own);
+}
+
+test "Client.init with allocator" {
+    const allocator = std.testing.allocator;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .allocator = allocator,
+        .read_buf_size = 128,
+        .write_buf_size = 256,
+    });
+    defer client.deinit();
+
+    try std.testing.expectEqual(true, client.read_buf_own);
+    try std.testing.expectEqual(true, client.write_buf_own);
+    try std.testing.expectEqual(@as(usize, 128), client.read_buf.len);
+    try std.testing.expectEqual(@as(usize, 256), client.write_buf.len);
+}
+
+test "Client.init requires allocator when no buffers provided" {
+    try std.testing.expectError(error.AllocatorRequired, Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+    }));
+}
+
+test "Client.init requires host or ip" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    try std.testing.expectError(error.HostOrIPRequired, Client.init(.{
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    }));
+}
+
+test "Client.init default values" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    try std.testing.expectEqual(@as(i32, 10_000), client.connect_timeout);
+    try std.testing.expectEqual(@as(u16, 1), client.default_retries);
+    try std.testing.expectEqual(@as(i32, 5_000), client.default_timeout);
+}
+
+test "Client.init custom timeouts" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+        .connect_timeout = 5_000,
+        .default_retries = 3,
+        .default_timeout = 10_000,
+    });
+    defer client.deinit();
+
+    try std.testing.expectEqual(@as(i32, 5_000), client.connect_timeout);
+    try std.testing.expectEqual(@as(u16, 3), client.default_retries);
+    try std.testing.expectEqual(@as(i32, 10_000), client.default_timeout);
+}
+
+test "Client.packetIdentifier auto-increment" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // First call returns 1, then increments
+    try std.testing.expectEqual(@as(u16, 1), client.packetIdentifier(null));
+    try std.testing.expectEqual(@as(u16, 2), client.packetIdentifier(null));
+    try std.testing.expectEqual(@as(u16, 3), client.packetIdentifier(null));
+}
+
+test "Client.packetIdentifier explicit value" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // Explicit value doesn't affect internal counter
+    try std.testing.expectEqual(@as(u16, 100), client.packetIdentifier(100));
+    try std.testing.expectEqual(@as(u16, 1), client.packetIdentifier(null));
+    try std.testing.expectEqual(@as(u16, 200), client.packetIdentifier(200));
+    try std.testing.expectEqual(@as(u16, 2), client.packetIdentifier(null));
+}
+
+test "Client.packetIdentifier wraps around" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    client.packet_identifier = 65535;
+    try std.testing.expectEqual(@as(u16, 65535), client.packetIdentifier(null));
+    try std.testing.expectEqual(@as(u16, 0), client.packetIdentifier(null));
+    try std.testing.expectEqual(@as(u16, 1), client.packetIdentifier(null));
+}
+
+test "Client.bufferedPacket with no data" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // No data in buffer
+    try std.testing.expectEqual(@as(?Packet, null), try client.getBufferedPacket());
+}
+
+test "Client.bufferedPacket incomplete packet" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // Only 1 byte - need at least 2
+    try client.injectReadData(&[_]u8{0x20});
+    try std.testing.expectEqual(@as(?Packet, null), try client.getBufferedPacket());
+}
+
+test "Client.bufferedPacket CONNACK" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // CONNACK: type 2, remaining length 2, session_present=0, return_code=0
+    try client.injectReadData(&[_]u8{ 0x20, 0x02, 0x00, 0x00 });
+
+    const packet = try client.getBufferedPacket();
+    try std.testing.expect(packet != null);
+    try std.testing.expect(packet.? == .connack);
+    try std.testing.expectEqual(false, packet.?.connack.session_present);
+    try std.testing.expectEqual(Packet.ConnAck.ReturnCode.accepted, packet.?.connack.return_code);
+
+    // read_pos should advance past the packet
+    try std.testing.expectEqual(@as(usize, 4), client.read_pos);
+}
+
+test "Client.bufferedPacket PUBACK" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // PUBACK: type 4, remaining length 2, packet_id = 0x0042 (66)
+    try client.injectReadData(&[_]u8{ 0x40, 0x02, 0x00, 0x42 });
+
+    const packet = try client.getBufferedPacket();
+    try std.testing.expect(packet != null);
+    try std.testing.expect(packet.? == .puback);
+    try std.testing.expectEqual(@as(u16, 66), packet.?.puback.packet_identifier);
+}
+
+test "Client.bufferedPacket PUBLISH QoS 0" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // PUBLISH QoS 0: type 3, flags 0, remaining length 7
+    // Topic: "t" (len=1), message: "test"
+    try client.injectReadData(&[_]u8{ 0x30, 0x07, 0x00, 0x01, 't', 't', 'e', 's', 't' });
+
+    const packet = try client.getBufferedPacket();
+    try std.testing.expect(packet != null);
+    try std.testing.expect(packet.? == .publish);
+    try std.testing.expectEqualStrings("t", packet.?.publish.topic);
+    try std.testing.expectEqualStrings("test", packet.?.publish.message);
+    try std.testing.expectEqual(QoS.at_most_once, packet.?.publish.qos);
+    try std.testing.expectEqual(@as(?u16, null), packet.?.publish.packet_identifier);
+}
+
+test "Client.bufferedPacket PUBLISH QoS 1" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // PUBLISH QoS 1: type 3, flags 2 (qos=1), remaining length 9
+    // Topic: "t" (len=1), packet_id=0x000A (10), message: "test"
+    try client.injectReadData(&[_]u8{ 0x32, 0x09, 0x00, 0x01, 't', 0x00, 0x0A, 't', 'e', 's', 't' });
+
+    const packet = try client.getBufferedPacket();
+    try std.testing.expect(packet != null);
+    try std.testing.expect(packet.? == .publish);
+    try std.testing.expectEqualStrings("t", packet.?.publish.topic);
+    try std.testing.expectEqualStrings("test", packet.?.publish.message);
+    try std.testing.expectEqual(QoS.at_least_once, packet.?.publish.qos);
+    try std.testing.expectEqual(@as(?u16, 10), packet.?.publish.packet_identifier);
+}
+
+test "Client.bufferedPacket SUBACK" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // SUBACK: type 9, remaining length 4, packet_id=0x0001, results=[0x00, 0x01]
+    try client.injectReadData(&[_]u8{ 0x90, 0x04, 0x00, 0x01, 0x00, 0x01 });
+
+    const packet = try client.getBufferedPacket();
+    try std.testing.expect(packet != null);
+    try std.testing.expect(packet.? == .suback);
+    try std.testing.expectEqual(@as(u16, 1), packet.?.suback.packet_identifier);
+    try std.testing.expectEqual(QoS.at_most_once, try packet.?.suback.result(0));
+    try std.testing.expectEqual(QoS.at_least_once, try packet.?.suback.result(1));
+}
+
+test "Client.bufferedPacket PINGRESP" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // PINGRESP: type 13, remaining length 0
+    try client.injectReadData(&[_]u8{ 0xD0, 0x00 });
+
+    const packet = try client.getBufferedPacket();
+    try std.testing.expect(packet != null);
+    try std.testing.expect(packet.? == .pingresp);
+}
+
+test "Client.bufferedPacket multiple packets" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // Two packets: PINGRESP + CONNACK
+    try client.injectReadData(&[_]u8{
+        0xD0, 0x00, // PINGRESP
+        0x20, 0x02, 0x01, 0x00, // CONNACK with session_present=1
+    });
+
+    // First packet
+    const packet1 = try client.getBufferedPacket();
+    try std.testing.expect(packet1 != null);
+    try std.testing.expect(packet1.? == .pingresp);
+    try std.testing.expectEqual(@as(usize, 2), client.read_pos);
+
+    // Second packet
+    const packet2 = try client.getBufferedPacket();
+    try std.testing.expect(packet2 != null);
+    try std.testing.expect(packet2.? == .connack);
+    try std.testing.expectEqual(true, packet2.?.connack.session_present);
+    try std.testing.expectEqual(@as(usize, 6), client.read_pos);
+
+    // No more packets
+    try std.testing.expectEqual(@as(?Packet, null), try client.getBufferedPacket());
+}
+
+test "Client.bufferedPacket incomplete varint" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // Packet type + continuation byte (incomplete varint)
+    try client.injectReadData(&[_]u8{ 0x30, 0x80 });
+    try std.testing.expectEqual(@as(?Packet, null), try client.getBufferedPacket());
+}
+
+test "Client.bufferedPacket invalid varint" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // 5 continuation bytes - invalid per MQTT spec
+    try client.injectReadData(&[_]u8{ 0x30, 0x80, 0x80, 0x80, 0x80 });
+    try std.testing.expectError(error.MalformedPacket, client.getBufferedPacket());
+}
+
+test "Client.bufferedPacket unknown packet type" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // Type 0 is reserved/unknown
+    try client.injectReadData(&[_]u8{ 0x00, 0x00 });
+    try std.testing.expectError(error.Protocol, client.getBufferedPacket());
+}
+
+test "Client.injectReadData buffer full" {
+    var read_buf: [4]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // Fill buffer
+    try client.injectReadData(&[_]u8{ 0x01, 0x02, 0x03, 0x04 });
+
+    // Try to inject more
+    try std.testing.expectError(error.ReadBufferIsFull, client.injectReadData(&[_]u8{0x05}));
+}
+
+test "Client.lastReadPacket" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // Initially empty
+    try std.testing.expectEqual(@as(usize, 0), client.lastReadPacket().len);
+
+    // After reading a packet
+    try client.injectReadData(&[_]u8{ 0xD0, 0x00 }); // PINGRESP
+    _ = try client.getBufferedPacket();
+
+    // lastReadPacket returns data up to read_pos
+    try std.testing.expectEqual(@as(usize, 2), client.lastReadPacket().len);
+    try std.testing.expectEqual([_]u8{ 0xD0, 0x00 }, client.lastReadPacket()[0..2].*);
+}
+
+test "Client.createContext uses defaults" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+        .default_retries = 5,
+        .default_timeout = 15_000,
+    });
+    defer client.deinit();
+
+    const ctx = client.createContext(.{});
+    try std.testing.expectEqual(@as(u16, 5), ctx.retries);
+    try std.testing.expectEqual(@as(i32, 15_000), ctx.timeout);
+}
+
+test "Client.createContext uses overrides" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+        .default_retries = 5,
+        .default_timeout = 15_000,
+    });
+    defer client.deinit();
+
+    const ctx = client.createContext(.{ .retries = 2, .timeout = 1_000 });
+    try std.testing.expectEqual(@as(u16, 2), ctx.retries);
+    try std.testing.expectEqual(@as(i32, 1_000), ctx.timeout);
+}
+
+test "Client.subscribe validation" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // Empty topics should fail
+    const result = client.subscribe(.{}, .{ .topics = &[_]SubscribeOpts.Topic{} });
+    try std.testing.expectError(error.Usage, result);
+    try std.testing.expectEqualStrings("must have at least 1 topic", client.lastError().?.details);
+}
+
+test "Client.unsubscribe validation" {
+    var read_buf: [64]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+
+    var client = try Client.init(.{
+        .ip = "127.0.0.1",
+        .port = 1883,
+        .read_buf = &read_buf,
+        .write_buf = &write_buf,
+    });
+    defer client.deinit();
+
+    // Empty topics should fail
+    const topics = [_][]const u8{};
+    const result = client.unsubscribe(.{}, .{ .topics = &topics });
+    try std.testing.expectError(error.Usage, result);
+    try std.testing.expectEqualStrings("must have at least 1 topic", client.lastError().?.details);
+}
